@@ -92,6 +92,12 @@ type frontendServer struct {
 	collectorConn *grpc.ClientConn
 
 	shoppingAssistantSvcAddr string
+
+	userSvcAddr string
+	userSvcConn *grpc.ClientConn
+
+	orderSvcAddr string
+	orderSvcConn *grpc.ClientConn
 }
 
 func main() {
@@ -161,6 +167,8 @@ func main() {
 	mustMapEnv(&svc.shippingSvcAddr, "SHIPPING_SERVICE_ADDR")
 	mustMapEnv(&svc.adSvcAddr, "AD_SERVICE_ADDR")
 	mustMapEnv(&svc.shoppingAssistantSvcAddr, "SHOPPING_ASSISTANT_SERVICE_ADDR")
+	mustMapEnv(&svc.userSvcAddr, "USER_SERVICE_ADDR")
+	mustMapEnv(&svc.orderSvcAddr, "ORDER_SERVICE_ADDR")
 
 	mustConnGRPC(ctx, &svc.currencySvcConn, svc.currencySvcAddr)
 	mustConnGRPC(ctx, &svc.productCatalogSvcConn, svc.productCatalogSvcAddr)
@@ -169,22 +177,35 @@ func main() {
 	mustConnGRPC(ctx, &svc.shippingSvcConn, svc.shippingSvcAddr)
 	mustConnGRPC(ctx, &svc.checkoutSvcConn, svc.checkoutSvcAddr)
 	mustConnGRPC(ctx, &svc.adSvcConn, svc.adSvcAddr)
+	mustConnGRPC(ctx, &svc.userSvcConn, svc.userSvcAddr)
+	mustConnGRPC(ctx, &svc.orderSvcConn, svc.orderSvcAddr)
 
 	r := mux.NewRouter()
+	// 公开路由
 	r.HandleFunc(baseUrl+"/", svc.homeHandler).Methods(http.MethodGet, http.MethodHead)
 	r.HandleFunc(baseUrl+"/product/{id}", svc.productHandler).Methods(http.MethodGet, http.MethodHead)
-	r.HandleFunc(baseUrl+"/cart", svc.viewCartHandler).Methods(http.MethodGet, http.MethodHead)
-	r.HandleFunc(baseUrl+"/cart", svc.addToCartHandler).Methods(http.MethodPost)
-	r.HandleFunc(baseUrl+"/cart/empty", svc.emptyCartHandler).Methods(http.MethodPost)
 	r.HandleFunc(baseUrl+"/setCurrency", svc.setCurrencyHandler).Methods(http.MethodPost)
-	r.HandleFunc(baseUrl+"/logout", svc.logoutHandler).Methods(http.MethodGet)
-	r.HandleFunc(baseUrl+"/cart/checkout", svc.placeOrderHandler).Methods(http.MethodPost)
+	r.HandleFunc(baseUrl+"/login", svc.loginPageHandler).Methods(http.MethodGet)
+	r.HandleFunc(baseUrl+"/login", svc.loginHandler).Methods(http.MethodPost)
+	r.HandleFunc(baseUrl+"/register", svc.registerPageHandler).Methods(http.MethodGet)
+	r.HandleFunc(baseUrl+"/register", svc.registerHandler).Methods(http.MethodPost)
 	r.HandleFunc(baseUrl+"/assistant", svc.assistantHandler).Methods(http.MethodGet)
 	r.PathPrefix(baseUrl + "/static/").Handler(http.StripPrefix(baseUrl+"/static/", http.FileServer(http.Dir("./static/"))))
 	r.HandleFunc(baseUrl+"/robots.txt", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, "User-agent: *\nDisallow: /") })
 	r.HandleFunc(baseUrl+"/_healthz", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, "ok") })
 	r.HandleFunc(baseUrl+"/product-meta/{ids}", svc.getProductByID).Methods(http.MethodGet)
 	r.HandleFunc(baseUrl+"/bot", svc.chatBotHandler).Methods(http.MethodPost)
+
+	// 需要认证的路由
+	authRouter := r.PathPrefix(baseUrl).Subrouter()
+	authRouter.Use(svc.requireAuth)
+	authRouter.HandleFunc("/cart", svc.viewCartHandler).Methods(http.MethodGet, http.MethodHead)
+	authRouter.HandleFunc("/cart", svc.addToCartHandler).Methods(http.MethodPost)
+	authRouter.HandleFunc("/cart/empty", svc.emptyCartHandler).Methods(http.MethodPost)
+	authRouter.HandleFunc("/cart/checkout", svc.placeOrderHandler).Methods(http.MethodPost)
+	authRouter.HandleFunc("/orders", svc.ordersHandler).Methods(http.MethodGet)
+	authRouter.HandleFunc("/order/{id}/cancel", svc.cancelOrderHandler).Methods(http.MethodPost)
+	authRouter.HandleFunc("/logout", svc.logoutHandler).Methods(http.MethodGet)
 
 	var handler http.Handler = r
 	handler = ensureSessionID(handler)

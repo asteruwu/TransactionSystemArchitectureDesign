@@ -1,0 +1,98 @@
+<!--
+ Copyright 2020 Google LLC
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+-->
+
+{{ define "orders" }}
+{{ template "header" . }}
+<div {{ with $.platform_css }} class="{{.}}" {{ end }}>
+    <span class="platform-flag">
+        {{$.platform_name}}
+    </span>
+</div>
+<main role="main" class="py-5">
+    <section class="container">
+        <h3 class="mb-4">My Orders</h3>
+
+        {{ if not .orders }}
+        <div class="bg-light p-4 text-center">
+            <p>No orders yet.</p>
+            <a href="{{ $.baseUrl }}/" class="cymbal-button-primary">Start Shopping</a>
+        </div>
+        {{ else }}
+
+        {{ range .orders }}
+        <div class="bg-light p-3 mb-3">
+            <div class="row">
+                <div class="col-md-6">
+                    <strong>Order #{{ .OrderId }}</strong>
+                </div>
+                <div class="col-md-6 text-md-right">
+                    {{ if eq .Status 0 }}
+                    <span class="text-warning">Pending Payment</span>
+                    {{ else if eq .Status 1 }}
+                    <span class="text-info">Paid</span>
+                    {{ else if eq .Status 2 }}
+                    <span class="text-muted">Cancelled</span>
+                    {{ else if eq .Status 3 }}
+                    <span class="text-success">Shipped</span>
+                    {{ else if eq .Status 4 }}
+                    <span class="text-danger">Ship Failed</span>
+                    {{ end }}
+                </div>
+            </div>
+            <div class="row mt-2">
+                <div class="col-md-6">
+                    Total: {{ renderMoney .TotalPrice }}
+                </div>
+                <div class="col-md-6 text-md-right">
+                    {{ if eq .Status 3 }}
+                    Tracking: {{ .TrackingId }}
+                    {{ end }}
+                    {{ if eq .Status 0 }}
+                    <span class="text-danger" data-expires="{{ .ExpiresAt }}">
+                        Expires in <span class="countdown"></span>
+                    </span>
+                    <form method="POST" action="{{ $.baseUrl }}/order/{{ .OrderId }}/cancel" class="d-inline ml-2">
+                        <button type="submit" class="cymbal-button-secondary btn-sm">Cancel</button>
+                    </form>
+                    {{ end }}
+                </div>
+            </div>
+        </div>
+        {{ end }}
+
+        {{ end }}
+    </section>
+</main>
+
+<script>
+    // 倒计时
+    document.querySelectorAll('[data-expires]').forEach(function (el) {
+        var exp = parseInt(el.dataset.expires) * 1000;
+        var span = el.querySelector('.countdown');
+        function update() {
+            var left = Math.max(0, exp - Date.now());
+            var m = Math.floor(left / 60000);
+            var s = Math.floor((left % 60000) / 1000);
+            span.textContent = m + ':' + (s < 10 ? '0' : '') + s;
+            if (left === 0) location.reload();
+        }
+        update();
+        setInterval(update, 1000);
+    });
+</script>
+
+{{ template "footer" . }}
+{{ end }}

@@ -412,9 +412,6 @@ func (s *productCatalogService) RestockProduct(ctx context.Context, req *pb.Rest
 }
 
 func modelToProto(p *model.Product) *pb.Product {
-	units := int64(p.PriceUsd)
-	nanos := int32((p.PriceUsd - float64(units)) * 1e9)
-
 	categories := strings.Split(p.Categories, ",")
 
 	return &pb.Product{
@@ -423,9 +420,9 @@ func modelToProto(p *model.Product) *pb.Product {
 		Description: p.Description,
 		Picture:     p.Picture,
 		PriceUsd: &pb.Money{
-			CurrencyCode: "USD",
-			Units:        units,
-			Nanos:        nanos,
+			CurrencyCode: p.PriceUsdCurrencyCode,
+			Units:        p.PriceUsdUnits,
+			Nanos:        p.PriceUsdNanos,
 		},
 		Categories: categories,
 		Stock:      p.Stock,

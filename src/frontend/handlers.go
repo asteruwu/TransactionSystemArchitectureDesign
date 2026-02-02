@@ -87,7 +87,7 @@ func (fe *frontendServer) homeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 远程调用其他模块的方法，获得购物车信息
-	cart, err := fe.getCart(r.Context(), sessionID(r))
+	cart, err := fe.getCart(r.Context(), cartUserID(r))
 	if err != nil {
 		renderHTTPError(log, r, w, errors.Wrap(err, "could not retrieve cart"), http.StatusInternalServerError)
 		return
@@ -195,7 +195,7 @@ func (fe *frontendServer) productHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	cart, err := fe.getCart(r.Context(), sessionID(r))
+	cart, err := fe.getCart(r.Context(), cartUserID(r))
 	if err != nil {
 		renderHTTPError(log, r, w, errors.Wrap(err, "could not retrieve cart"), http.StatusInternalServerError)
 		return
@@ -278,7 +278,7 @@ func (fe *frontendServer) addToCartHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	// 远程调用插入购物车表单的方法，基于sessionID（用于区别用户吧），在购物车表单中添加刚才的产品ID和数量
-	if err := fe.insertCart(r.Context(), sessionID(r), p.GetId(), int32(payload.Quantity)); err != nil {
+	if err := fe.insertCart(r.Context(), cartUserID(r), p.GetId(), int32(payload.Quantity)); err != nil {
 		renderHTTPError(log, r, w, errors.Wrap(err, "failed to add to cart"), http.StatusInternalServerError)
 		return
 	}
@@ -293,7 +293,7 @@ func (fe *frontendServer) emptyCartHandler(w http.ResponseWriter, r *http.Reques
 	log := r.Context().Value(ctxKeyLog{}).(logrus.FieldLogger)
 	log.Debug("emptying cart")
 
-	if err := fe.emptyCart(r.Context(), sessionID(r)); err != nil {
+	if err := fe.emptyCart(r.Context(), cartUserID(r)); err != nil {
 		renderHTTPError(log, r, w, errors.Wrap(err, "failed to empty cart"), http.StatusInternalServerError)
 		return
 	}
@@ -309,7 +309,7 @@ func (fe *frontendServer) viewCartHandler(w http.ResponseWriter, r *http.Request
 		renderHTTPError(log, r, w, errors.Wrap(err, "could not retrieve currencies"), http.StatusInternalServerError)
 		return
 	}
-	cart, err := fe.getCart(r.Context(), sessionID(r))
+	cart, err := fe.getCart(r.Context(), cartUserID(r))
 	if err != nil {
 		renderHTTPError(log, r, w, errors.Wrap(err, "could not retrieve cart"), http.StatusInternalServerError)
 		return
@@ -362,7 +362,7 @@ func (fe *frontendServer) viewCartHandler(w http.ResponseWriter, r *http.Request
 		"cart_size":        cartSize(cart),
 		"shipping_cost":    shippingCost,
 		"show_currency":    true,
-		"total_cost":       totalPrice,
+		"total_cost":       &totalPrice,
 		"items":            items,
 		"expiration_years": []int{year, year + 1, year + 2, year + 3, year + 4},
 	})); err != nil {
@@ -418,7 +418,7 @@ func (fe *frontendServer) placeOrderHandler(w http.ResponseWriter, r *http.Reque
 				CreditCardExpirationMonth: int32(payload.CcMonth),
 				CreditCardExpirationYear:  int32(payload.CcYear),
 				CreditCardCvv:             int32(payload.CcCVV)},
-			UserId:       sessionID(r),
+			UserId:       cartUserID(r),
 			UserCurrency: currentCurrency(r),
 			Address: &pb.Address{
 				StreetAddress: payload.StreetAddress,
@@ -630,6 +630,7 @@ func injectCommonTemplateData(r *http.Request, payload map[string]interface{}) m
 		"frontendMessage":   frontendMessage,
 		"currentYear":       time.Now().Year(),
 		"baseUrl":           baseUrl,
+		"user_id":           getUserID(r),
 	}
 
 	for k, v := range payload {
@@ -655,6 +656,15 @@ func sessionID(r *http.Request) string {
 	return ""
 }
 
+// cartUserID 获取购物车用户标识
+// 认证用户使用 user_id，匿名用户使用 session_id
+func cartUserID(r *http.Request) string {
+	if uid := getUserID(r); uid != "" {
+		return uid
+	}
+	return sessionID(r)
+}
+
 func cartIDs(c []*pb.CartItem) []string {
 	out := make([]string, len(c))
 	for i, v := range c {
@@ -672,7 +682,10 @@ func cartSize(c []*pb.CartItem) int {
 	return cartSize
 }
 
-func renderMoney(money pb.Money) string {
+func renderMoney(money *pb.Money) string {
+	if money == nil {
+		return "$0.00"
+	}
 	currencyLogo := renderCurrencyLogo(money.GetCurrencyCode())
 	return fmt.Sprintf("%s%d.%02d", currencyLogo, money.GetUnits(), money.GetNanos()/10000000)
 }
@@ -701,4 +714,150 @@ func stringinSlice(slice []string, val string) bool {
 		}
 	}
 	return false
+}
+
+// ==================== 认证相关处理器 ====================
+
+// loginPageHandler 登录页面
+func (fe *frontendServer) loginPageHandler(w http.ResponseWriter, r *http.Request) {
+	currencies, _ := fe.getCurrencies(r.Context())
+	if err := templates.ExecuteTemplate(w, "login", injectCommonTemplateData(r, map[string]interface{}{
+		"currencies":    currencies,
+		"show_currency": false,
+		"register":      false,
+	})); err != nil {
+		log.Println(err)
+	}
+}
+
+// registerPageHandler 注册页面
+func (fe *frontendServer) registerPageHandler(w http.ResponseWriter, r *http.Request) {
+	currencies, _ := fe.getCurrencies(r.Context())
+	if err := templates.ExecuteTemplate(w, "login", injectCommonTemplateData(r, map[string]interface{}{
+		"currencies":    currencies,
+		"show_currency": false,
+		"register":      true,
+	})); err != nil {
+		log.Println(err)
+	}
+}
+
+// loginHandler 登录提交
+func (fe *frontendServer) loginHandler(w http.ResponseWriter, r *http.Request) {
+	log := r.Context().Value(ctxKeyLog{}).(logrus.FieldLogger)
+	username := r.FormValue("username")
+	password := r.FormValue("password")
+
+	resp, err := pb.NewUserServiceClient(fe.userSvcConn).Login(
+		r.Context(),
+		&pb.LoginRequest{Username: username, Password: password},
+	)
+	if err != nil {
+		currencies, _ := fe.getCurrencies(r.Context())
+		if err := templates.ExecuteTemplate(w, "login", injectCommonTemplateData(r, map[string]interface{}{
+			"currencies":    currencies,
+			"show_currency": false,
+			"register":      false,
+			"error":         "Invalid username or password",
+		})); err != nil {
+			log.Println(err)
+		}
+		return
+	}
+
+	// 设置 token cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     cookieToken,
+		Value:    resp.Token,
+		MaxAge:   cookieMaxAge,
+		HttpOnly: true,
+	})
+
+	http.Redirect(w, r, baseUrl+"/", http.StatusSeeOther)
+}
+
+// registerHandler 注册提交
+func (fe *frontendServer) registerHandler(w http.ResponseWriter, r *http.Request) {
+	log := r.Context().Value(ctxKeyLog{}).(logrus.FieldLogger)
+	username := r.FormValue("username")
+	password := r.FormValue("password")
+
+	_, err := pb.NewUserServiceClient(fe.userSvcConn).Register(
+		r.Context(),
+		&pb.RegisterRequest{Username: username, Password: password},
+	)
+	if err != nil {
+		currencies, _ := fe.getCurrencies(r.Context())
+		if err := templates.ExecuteTemplate(w, "login", injectCommonTemplateData(r, map[string]interface{}{
+			"currencies":    currencies,
+			"show_currency": false,
+			"register":      true,
+			"error":         "Registration failed: username may already exist",
+		})); err != nil {
+			log.Println(err)
+		}
+		return
+	}
+
+	// 注册成功后自动登录
+	loginResp, err := pb.NewUserServiceClient(fe.userSvcConn).Login(
+		r.Context(),
+		&pb.LoginRequest{Username: username, Password: password},
+	)
+	if err != nil {
+		http.Redirect(w, r, baseUrl+"/login", http.StatusSeeOther)
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     cookieToken,
+		Value:    loginResp.Token,
+		MaxAge:   cookieMaxAge,
+		HttpOnly: true,
+	})
+
+	http.Redirect(w, r, baseUrl+"/", http.StatusSeeOther)
+}
+
+// ==================== 订单相关处理器 ====================
+
+// ordersHandler 订单历史页面
+func (fe *frontendServer) ordersHandler(w http.ResponseWriter, r *http.Request) {
+	log := r.Context().Value(ctxKeyLog{}).(logrus.FieldLogger)
+	userID := getUserID(r)
+
+	resp, err := pb.NewOrderServiceClient(fe.orderSvcConn).ListOrders(
+		r.Context(),
+		&pb.ListOrdersRequest{UserId: userID},
+	)
+	if err != nil {
+		renderHTTPError(log, r, w, errors.Wrap(err, "failed to list orders"), http.StatusInternalServerError)
+		return
+	}
+
+	currencies, _ := fe.getCurrencies(r.Context())
+	if err := templates.ExecuteTemplate(w, "orders", injectCommonTemplateData(r, map[string]interface{}{
+		"currencies":    currencies,
+		"show_currency": false,
+		"orders":        resp.Orders,
+	})); err != nil {
+		log.Println(err)
+	}
+}
+
+// cancelOrderHandler 取消订单
+func (fe *frontendServer) cancelOrderHandler(w http.ResponseWriter, r *http.Request) {
+	log := r.Context().Value(ctxKeyLog{}).(logrus.FieldLogger)
+	orderID := mux.Vars(r)["id"]
+
+	_, err := pb.NewOrderServiceClient(fe.orderSvcConn).CancelOrderWithoutPayment(
+		r.Context(),
+		&pb.CancelOrderRequest{OrderId: orderID},
+	)
+	if err != nil {
+		renderHTTPError(log, r, w, errors.Wrap(err, "failed to cancel order"), http.StatusInternalServerError)
+		return
+	}
+
+	http.Redirect(w, r, baseUrl+"/orders", http.StatusSeeOther)
 }

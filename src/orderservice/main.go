@@ -22,6 +22,8 @@ import (
 	redis "github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
@@ -49,8 +51,17 @@ func main() {
 	repo, rdb := initDB()
 
 	// Init RocketMQ Producer
+	rocketmqAddr := os.Getenv("ROCKETMQ_NAMESERVER")
+	if rocketmqAddr == "" {
+		rocketmqAddr = "localhost:9876"
+	}
+
+	// RocketMQ Go 客户端不支持主机名，需要解析为 IP 地址
+	resolvedAddr := resolveToIP(rocketmqAddr)
+	log.Infof("RocketMQ NameServer: %s -> %s", rocketmqAddr, resolvedAddr)
+
 	p, err := rocketmq.NewProducer(
-		producer.WithNameServer([]string{"localhost:9876"}),
+		producer.WithNameServer([]string{resolvedAddr}),
 		producer.WithGroupName("order_stream_producer_group"),
 		producer.WithRetry(2),
 	)
@@ -65,7 +76,11 @@ func main() {
 	}
 	defer p.Shutdown()
 	// 4. Init gRPC Clients (Needed for TimeoutWorker and Service)
-	catalogConn, _ := grpc.Dial("productcatalogservice:3550", grpc.WithInsecure())
+	catalogAddr := os.Getenv("PRODUCT_CATALOG_SERVICE_ADDR")
+	if catalogAddr == "" {
+		catalogAddr = "productcatalogservice:3550"
+	}
+	catalogConn, _ := grpc.Dial(catalogAddr, grpc.WithInsecure())
 	catalogClient := pb.NewProductCatalogServiceClient(catalogConn)
 
 	paymentAddr := os.Getenv("PAYMENT_SERVICE_ADDR")
@@ -95,7 +110,7 @@ func main() {
 	streamWorker.Start(ctx, wg)
 
 	// 6. Start RocketMQ Consumer (下游)
-	consumerWorker, err := worker.NewConsumerWorker([]string{"localhost:9876"}, "order_db_group", p, repo, log)
+	consumerWorker, err := worker.NewConsumerWorker([]string{resolvedAddr}, "order_db_group", p, repo, log)
 	if err != nil {
 		log.Fatalf("Failed to init consumer: %v", err)
 	}
@@ -103,7 +118,7 @@ func main() {
 	go consumerWorker.Start(ctx, wg, "orders")
 
 	// 7. Start RocketMQ Status Consumer
-	statusConsumerWorker, err := worker.NewConsumerWorker([]string{"localhost:9876"}, "order_status_group", p, repo, log)
+	statusConsumerWorker, err := worker.NewConsumerWorker([]string{resolvedAddr}, "order_status_group", p, repo, log)
 	if err != nil {
 		log.Fatalf("Failed to init status consumer: %v", err)
 	}
@@ -116,7 +131,7 @@ func main() {
 
 	// 9. Start DLQ Consumer (Dead Letter Queue Monitoring)
 	// Monitor the default DLQ topic for our consumer group
-	dlqConsumer, err := worker.NewDLQConsumer("localhost:9876", repo)
+	dlqConsumer, err := worker.NewDLQConsumer(resolvedAddr, repo)
 	if err != nil {
 		log.Errorf("Failed to init DLQ consumer: %v", err)
 	} else {
@@ -139,11 +154,20 @@ func main() {
 	// 11. Start gRPC Server
 	orderSvc := service.NewOrderService(catalogClient, paymentClient, shippingClient, p, repo, shipmentFlusher)
 
-	lis, _ := net.Listen("tcp", ":50051")
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "50051"
+	}
+	lis, _ := net.Listen("tcp", ":"+port)
 	s := grpc.NewServer()
 	pb.RegisterOrderServiceServer(s, orderSvc)
 
-	log.Info("OrderService started on :50051")
+	// 注册 gRPC Health Service (K8s 健康检查需要)
+	healthServer := health.NewServer()
+	healthpb.RegisterHealthServer(s, healthServer)
+	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+
+	log.Infof("OrderService started on :%s", port)
 	s.Serve(lis)
 
 	sigCh := make(chan os.Signal, 1)
@@ -167,6 +191,14 @@ func initDB() (repository.OrderRepo, *redis.Client) {
 	}
 
 	dsn := mysqlAddr
+	if !strings.Contains(dsn, "parseTime=true") {
+		if strings.Contains(dsn, "?") {
+			dsn += "&parseTime=true"
+		} else {
+			dsn += "?parseTime=true"
+		}
+	}
+
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {
 		log.Fatalf("failed to connect to mysql: %v", err)
@@ -209,4 +241,34 @@ func initDB() (repository.OrderRepo, *redis.Client) {
 	log.Info("connected to redis")
 
 	return repo, rdb
+}
+
+// resolveToIP 将 hostname:port 格式解析为 ip:port 格式
+// RocketMQ Go 客户端不支持主机名，需要先进行 DNS 解析
+func resolveToIP(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr // 无法解析则原样返回
+	}
+
+	// 检查是否已经是 IP 地址
+	if ip := net.ParseIP(host); ip != nil {
+		return addr // 已经是 IP，直接返回
+	}
+
+	// DNS 解析主机名
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return addr // 解析失败则原样返回
+	}
+
+	// 优先使用 IPv4 地址
+	for _, ip := range ips {
+		if ip4 := ip.To4(); ip4 != nil {
+			return net.JoinHostPort(ip4.String(), port)
+		}
+	}
+
+	// 没有 IPv4 则使用第一个 IP
+	return net.JoinHostPort(ips[0].String(), port)
 }

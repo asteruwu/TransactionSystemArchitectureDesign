@@ -11,6 +11,7 @@ import (
 	"github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/pkg/repository"
 	"github.com/apache/rocketmq-client-go/v2/primitive"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -32,6 +33,7 @@ type OrderService struct {
 	producer       MQProducer
 	repo           repository.OrderRepo
 	shipmentPusher ShipmentPusher
+	rdb            *redis.Client
 }
 
 // 订单服务初始化
@@ -263,4 +265,82 @@ func extractCartItemsFromProto(items []*pb.OrderItem) []*pb.CartItem {
 		cartItems = append(cartItems, item.Item)
 	}
 	return cartItems
+}
+
+// 订单过期时间（5分钟）
+const orderExpirationDuration = 5 * time.Minute
+
+// GetOrder 获取单个订单详情
+func (s *OrderService) GetOrder(ctx context.Context, req *pb.GetOrderRequest) (*pb.GetOrderResponse, error) {
+	order, err := s.repo.GetOrder(ctx, req.OrderId)
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "order not found: %v", err)
+	}
+
+	resp := &pb.GetOrderResponse{
+		OrderId:   order.OrderID,
+		UserId:    order.UserID,
+		Status:    order.Status,
+		CreatedAt: order.CreatedAt.Unix(),
+		TotalPrice: &pb.Money{
+			CurrencyCode: order.TotalPrice.CurrencyCode,
+			Units:        order.TotalPrice.Units,
+			Nanos:        order.TotalPrice.Nanos,
+		},
+		Items: convertItemsToProto(order.Items),
+	}
+
+	// PENDING 订单添加过期时间
+	if order.Status == model.OrderStatusPending {
+		resp.ExpiresAt = order.CreatedAt.Add(orderExpirationDuration).Unix()
+	}
+
+	// 已发货订单获取 tracking_id
+	if order.Status == model.OrderStatusShipped {
+		if shipment, err := s.repo.GetShipment(ctx, req.OrderId); err == nil && shipment != nil {
+			resp.TrackingId = shipment.TrackingID
+		}
+	}
+
+	return resp, nil
+}
+
+// ListOrders 获取用户所有订单
+func (s *OrderService) ListOrders(ctx context.Context, req *pb.ListOrdersRequest) (*pb.ListOrdersResponse, error) {
+	orders, err := s.repo.ListOrdersByUser(ctx, req.UserId)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to list orders: %v", err)
+	}
+
+	var respOrders []*pb.GetOrderResponse
+	for _, order := range orders {
+		respOrder := &pb.GetOrderResponse{
+			OrderId:   order.OrderID,
+			UserId:    order.UserID,
+			Status:    order.Status,
+			CreatedAt: order.CreatedAt.Unix(),
+			TotalPrice: &pb.Money{
+				CurrencyCode: order.TotalPrice.CurrencyCode,
+				Units:        order.TotalPrice.Units,
+				Nanos:        order.TotalPrice.Nanos,
+			},
+			Items: convertItemsToProto(order.Items),
+		}
+
+		// PENDING 订单添加过期时间
+		if order.Status == model.OrderStatusPending {
+			respOrder.ExpiresAt = order.CreatedAt.Add(orderExpirationDuration).Unix()
+		}
+
+		// 已发货订单获取 tracking_id
+		if order.Status == model.OrderStatusShipped {
+			if shipment, err := s.repo.GetShipment(ctx, order.OrderID); err == nil && shipment != nil {
+				respOrder.TrackingId = shipment.TrackingID
+			}
+		}
+
+		respOrders = append(respOrders, respOrder)
+	}
+
+	return &pb.ListOrdersResponse{Orders: respOrders}, nil
 }

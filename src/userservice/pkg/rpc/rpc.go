@@ -47,3 +47,14 @@ func (s *UserService) VerifyToken(ctx context.Context, req *pb.VerifyTokenReques
 		UserId:  uid,
 	}, nil
 }
+
+func (s *UserService) RefreshToken(ctx context.Context, req *pb.RefreshTokenRequest) (*pb.RefreshTokenResponse, error) {
+	newToken, expiresAt, err := s.Logic.RefreshToken(ctx, req.Token)
+	if err != nil {
+		return nil, status.Error(codes.Unauthenticated, "failed to refresh token")
+	}
+	return &pb.RefreshTokenResponse{
+		NewToken:  newToken,
+		ExpiresAt: expiresAt,
+	}, nil
+}

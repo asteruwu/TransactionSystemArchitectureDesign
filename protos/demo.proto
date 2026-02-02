@@ -294,6 +294,7 @@ service UserService {
     rpc Register(RegisterRequest) returns (RegisterResponse) {}
     rpc Login(LoginRequest) returns (LoginResponse) {}
     rpc VerifyToken(VerifyTokenRequest) returns (VerifyTokenResponse) {}
+    rpc RefreshToken(RefreshTokenRequest) returns (RefreshTokenResponse) {}
 }
 
 message RegisterRequest {
@@ -324,10 +325,21 @@ message VerifyTokenResponse {
     string user_id = 2;
 }
 
+message RefreshTokenRequest {
+    string token = 1;
+}
+
+message RefreshTokenResponse {
+    string new_token = 1;
+    int64 expires_at = 2;
+}
+
 // ---------------Order service----------------
 service OrderService {
     rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse) {}
     rpc CancelOrderWithoutPayment(CancelOrderRequest) returns (CancelOrderResponse) {}
+    rpc GetOrder(GetOrderRequest) returns (GetOrderResponse) {}
+    rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse) {}
 }
 
 message CreateOrderRequest {
@@ -360,4 +372,27 @@ message CancelOrderRequest {
 message CancelOrderResponse {
     bool success = 1;
     string message = 2;
+}
+
+message GetOrderRequest {
+    string order_id = 1;
+}
+
+message GetOrderResponse {
+    string order_id = 1;
+    string user_id = 2;
+    int32 status = 3;
+    string tracking_id = 4;
+    Money total_price = 5;
+    int64 created_at = 6;
+    int64 expires_at = 7;
+    repeated OrderItem items = 8;
+}
+
+message ListOrdersRequest {
+    string user_id = 1;
+}
+
+message ListOrdersResponse {
+    repeated GetOrderResponse orders = 1;
 }

@@ -1,0 +1,66 @@
+<!--
+ Copyright 2020 Google LLC
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+-->
+
+{{ define "login" }}
+    {{ template "header" . }}
+    <div {{ with $.platform_css }} class="{{.}}" {{ end }}>
+        <span class="platform-flag">
+            {{$.platform_name}}
+        </span>
+    </div>
+    <main role="main" class="py-5">
+        <section class="container">
+            <div class="row justify-content-center">
+                <div class="col-md-6 col-lg-4">
+                    <div class="bg-light p-4">
+                        <h3 class="text-center mb-4">
+                            {{ if .register }}Create Account{{ else }}Sign In{{ end }}
+                        </h3>
+                        
+                        {{ if .error }}
+                        <div class="alert alert-danger">{{ .error }}</div>
+                        {{ end }}
+                        
+                        <form method="POST" action="{{ $.baseUrl }}/{{ if .register }}register{{ else }}login{{ end }}">
+                            <div class="cymbal-form-field mb-3">
+                                <label for="username">Username</label>
+                                <input type="text" id="username" name="username" required>
+                            </div>
+                            <div class="cymbal-form-field mb-3">
+                                <label for="password">Password</label>
+                                <input type="password" id="password" name="password" required>
+                            </div>
+                            <div class="text-center">
+                                <button type="submit" class="cymbal-button-primary">
+                                    {{ if .register }}Register{{ else }}Sign In{{ end }}
+                                </button>
+                            </div>
+                        </form>
+                        
+                        <p class="text-center mt-3 mb-0">
+                            {{ if .register }}
+                            Already have an account? <a href="{{ $.baseUrl }}/login">Sign In</a>
+                            {{ else }}
+                            Don't have an account? <a href="{{ $.baseUrl }}/register">Register</a>
+                            {{ end }}
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+    {{ template "footer" . }}
+{{ end }}

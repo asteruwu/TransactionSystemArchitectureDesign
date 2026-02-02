@@ -20,8 +20,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
+	pb "github.com/GoogleCloudPlatform/microservices-demo/src/frontend/genproto"
 	"github.com/google/uuid"
 	redis "github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
@@ -59,6 +61,7 @@ var tokenBucketScript = redis.NewScript(`
 
 type ctxKeyLog struct{}
 type ctxKeyRequestID struct{}
+type ctxKeyUserID struct{}
 
 type logHandler struct {
 	log  *logrus.Logger
@@ -149,14 +152,31 @@ func ensureSessionID(next http.Handler) http.HandlerFunc {
 }
 
 func NewRedisLimiter(log *logrus.Logger) *Limiter {
-	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" {
-		redisAddr = "localhost:6380"
-		log.Info("Tried to connect to Redis, but REDIS_ADDR is not set. Using default address.")
+	var rdb *redis.Client
+	sentinelAddrs := os.Getenv("REDIS_SENTINEL_ADDRS")
+
+	if sentinelAddrs != "" {
+		// [模式 A] 哨兵模式 (生产环境/K8s)
+		log.Infof("Initializing Redis in Sentinel Mode. Sentinels: %s", sentinelAddrs)
+
+		rdb = redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:    "mymaster",
+			SentinelAddrs: strings.Split(sentinelAddrs, ","),
+			DB:            0,
+		})
+	} else {
+		// [模式 B] 单机模式 (本地开发/旧环境)
+		redisAddr := os.Getenv("REDIS_ADDR")
+		if redisAddr == "" {
+			redisAddr = "localhost:6380" // 本地默认
+			log.Info("Tried to connect to Redis, but REDIS_ADDR is not set. Using default address.")
+		}
+		log.Infof("Initializing Redis in Single Node Mode. Addr: %s", redisAddr)
+
+		rdb = redis.NewClient(&redis.Options{
+			Addr: redisAddr,
+		})
 	}
-	rdb := redis.NewClient(&redis.Options{
-		Addr: redisAddr,
-	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
 	defer cancel()
@@ -230,4 +250,41 @@ func getRealIP(r *http.Request) string {
 		ip, _, _ = net.SplitHostPort(r.RemoteAddr)
 	}
 	return ip
+}
+
+const cookieToken = cookiePrefix + "token"
+
+// requireAuth 认证中间件
+func (fe *frontendServer) requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenCookie, err := r.Cookie(cookieToken)
+		if err != nil || tokenCookie.Value == "" {
+			http.Redirect(w, r, baseUrl+"/login", http.StatusSeeOther)
+			return
+		}
+
+		// 验证 token
+		resp, err := pb.NewUserServiceClient(fe.userSvcConn).VerifyToken(
+			r.Context(),
+			&pb.VerifyTokenRequest{Token: tokenCookie.Value},
+		)
+		if err != nil || !resp.IsValid {
+			// 清除失效 cookie
+			http.SetCookie(w, &http.Cookie{Name: cookieToken, MaxAge: -1})
+			http.Redirect(w, r, baseUrl+"/login", http.StatusSeeOther)
+			return
+		}
+
+		// 注入 user_id
+		ctx := context.WithValue(r.Context(), ctxKeyUserID{}, resp.UserId)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// getUserID 从 context 获取用户 ID
+func getUserID(r *http.Request) string {
+	if uid, ok := r.Context().Value(ctxKeyUserID{}).(string); ok {
+		return uid
+	}
+	return ""
 }

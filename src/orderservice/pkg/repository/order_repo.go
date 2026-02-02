@@ -20,6 +20,8 @@ type OrderRepo interface {
 	UpdateOrderAndInsertShipment(ctx context.Context, orderID string, status int32, shipment *model.Shipment) error
 	GetPaidOrders(ctx context.Context, delay time.Duration, limit int) ([]*model.Order, error)
 	UpdateOrdersAndInsertShipmentsBatch(ctx context.Context, shipments []*model.Shipment) error
+	ListOrdersByUser(ctx context.Context, userID string) ([]*model.Order, error)
+	GetShipment(ctx context.Context, orderID string) (*model.Shipment, error)
 }
 
 type mysqlRepo struct {
@@ -166,4 +168,26 @@ func (r *mysqlRepo) UpdateOrdersAndInsertShipmentsBatch(ctx context.Context, shi
 
 		return tx.Exec(query, params...).Error
 	})
+}
+
+// [Frontend] 获取用户所有订单
+func (r *mysqlRepo) ListOrdersByUser(ctx context.Context, userID string) ([]*model.Order, error) {
+	var orders []*model.Order
+	err := r.db.WithContext(ctx).
+		Preload("Items").
+		Where("user_id = ?", userID).
+		Order("created_at DESC").
+		Limit(50).
+		Find(&orders).Error
+	return orders, err
+}
+
+// [Frontend] 获取发货信息
+func (r *mysqlRepo) GetShipment(ctx context.Context, orderID string) (*model.Shipment, error) {
+	var shipment model.Shipment
+	err := r.db.WithContext(ctx).Where("order_id = ?", orderID).First(&shipment).Error
+	if err != nil {
+		return nil, err
+	}
+	return &shipment, nil
 }

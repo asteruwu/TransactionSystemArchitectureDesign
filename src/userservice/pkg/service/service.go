@@ -20,6 +20,7 @@ type UserServiceLogic interface {
 	Register(ctx context.Context, username, password string) (string, error)
 	Login(ctx context.Context, username, password string) (string, string, error)
 	VerifyToken(ctx context.Context, tokenStr string) (string, bool)
+	RefreshToken(ctx context.Context, tokenStr string) (string, int64, error)
 }
 
 type userServiceLogic struct {
@@ -97,4 +98,37 @@ func (s *userServiceLogic) VerifyToken(ctx context.Context, tokenStr string) (st
 	}
 
 	return claims["user_id"].(string), true
+}
+
+func (s *userServiceLogic) RefreshToken(ctx context.Context, tokenStr string) (string, int64, error) {
+	// 1. 验证现有 token
+	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+		return jwtSecret, nil
+	})
+	if err != nil || !token.Valid {
+		return "", 0, errors.New("invalid token")
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", 0, errors.New("invalid token claims")
+	}
+	userID, ok := claims["user_id"].(string)
+	if !ok {
+		return "", 0, errors.New("invalid user_id in token")
+	}
+
+	// 2. 生成新 token（24小时）
+	newExp := time.Now().Add(24 * time.Hour)
+	newToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": userID,
+		"exp":     newExp.Unix(),
+	})
+
+	tokenString, err := newToken.SignedString(jwtSecret)
+	if err != nil {
+		return "", 0, err
+	}
+
+	return tokenString, newExp.Unix(), nil
 }

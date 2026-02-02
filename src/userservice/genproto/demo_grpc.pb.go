@@ -317,6 +317,7 @@ const (
 	ProductCatalogService_GetProduct_FullMethodName     = "/hipstershop.ProductCatalogService/GetProduct"
 	ProductCatalogService_SearchProducts_FullMethodName = "/hipstershop.ProductCatalogService/SearchProducts"
 	ProductCatalogService_ChargeProduct_FullMethodName  = "/hipstershop.ProductCatalogService/ChargeProduct"
+	ProductCatalogService_RestockProduct_FullMethodName = "/hipstershop.ProductCatalogService/RestockProduct"
 )
 
 // ProductCatalogServiceClient is the client API for ProductCatalogService service.
@@ -327,6 +328,7 @@ type ProductCatalogServiceClient interface {
 	GetProduct(ctx context.Context, in *GetProductRequest, opts ...grpc.CallOption) (*Product, error)
 	SearchProducts(ctx context.Context, in *SearchProductsRequest, opts ...grpc.CallOption) (*SearchProductsResponse, error)
 	ChargeProduct(ctx context.Context, in *ChargeProductRequest, opts ...grpc.CallOption) (*ChargeProductResponse, error)
+	RestockProduct(ctx context.Context, in *RestockProductRequest, opts ...grpc.CallOption) (*Empty, error)
 }
 
 type productCatalogServiceClient struct {
@@ -377,6 +379,16 @@ func (c *productCatalogServiceClient) ChargeProduct(ctx context.Context, in *Cha
 	return out, nil
 }
 
+func (c *productCatalogServiceClient) RestockProduct(ctx context.Context, in *RestockProductRequest, opts ...grpc.CallOption) (*Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Empty)
+	err := c.cc.Invoke(ctx, ProductCatalogService_RestockProduct_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ProductCatalogServiceServer is the server API for ProductCatalogService service.
 // All implementations must embed UnimplementedProductCatalogServiceServer
 // for forward compatibility.
@@ -385,6 +397,7 @@ type ProductCatalogServiceServer interface {
 	GetProduct(context.Context, *GetProductRequest) (*Product, error)
 	SearchProducts(context.Context, *SearchProductsRequest) (*SearchProductsResponse, error)
 	ChargeProduct(context.Context, *ChargeProductRequest) (*ChargeProductResponse, error)
+	RestockProduct(context.Context, *RestockProductRequest) (*Empty, error)
 	mustEmbedUnimplementedProductCatalogServiceServer()
 }
 
@@ -406,6 +419,9 @@ func (UnimplementedProductCatalogServiceServer) SearchProducts(context.Context, 
 }
 func (UnimplementedProductCatalogServiceServer) ChargeProduct(context.Context, *ChargeProductRequest) (*ChargeProductResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ChargeProduct not implemented")
+}
+func (UnimplementedProductCatalogServiceServer) RestockProduct(context.Context, *RestockProductRequest) (*Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method RestockProduct not implemented")
 }
 func (UnimplementedProductCatalogServiceServer) mustEmbedUnimplementedProductCatalogServiceServer() {}
 func (UnimplementedProductCatalogServiceServer) testEmbeddedByValue()                               {}
@@ -500,6 +516,24 @@ func _ProductCatalogService_ChargeProduct_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ProductCatalogService_RestockProduct_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RestockProductRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ProductCatalogServiceServer).RestockProduct(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ProductCatalogService_RestockProduct_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ProductCatalogServiceServer).RestockProduct(ctx, req.(*RestockProductRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ProductCatalogService_ServiceDesc is the grpc.ServiceDesc for ProductCatalogService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -523,14 +557,19 @@ var ProductCatalogService_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "ChargeProduct",
 			Handler:    _ProductCatalogService_ChargeProduct_Handler,
 		},
+		{
+			MethodName: "RestockProduct",
+			Handler:    _ProductCatalogService_RestockProduct_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "demo.proto",
 }
 
 const (
-	ShippingService_GetQuote_FullMethodName  = "/hipstershop.ShippingService/GetQuote"
-	ShippingService_ShipOrder_FullMethodName = "/hipstershop.ShippingService/ShipOrder"
+	ShippingService_GetQuote_FullMethodName      = "/hipstershop.ShippingService/GetQuote"
+	ShippingService_ShipOrder_FullMethodName     = "/hipstershop.ShippingService/ShipOrder"
+	ShippingService_GetTrackingId_FullMethodName = "/hipstershop.ShippingService/GetTrackingId"
 )
 
 // ShippingServiceClient is the client API for ShippingService service.
@@ -539,6 +578,7 @@ const (
 type ShippingServiceClient interface {
 	GetQuote(ctx context.Context, in *GetQuoteRequest, opts ...grpc.CallOption) (*GetQuoteResponse, error)
 	ShipOrder(ctx context.Context, in *ShipOrderRequest, opts ...grpc.CallOption) (*ShipOrderResponse, error)
+	GetTrackingId(ctx context.Context, in *GetTrackingIdRequest, opts ...grpc.CallOption) (*GetTrackingIdResponse, error)
 }
 
 type shippingServiceClient struct {
@@ -569,12 +609,23 @@ func (c *shippingServiceClient) ShipOrder(ctx context.Context, in *ShipOrderRequ
 	return out, nil
 }
 
+func (c *shippingServiceClient) GetTrackingId(ctx context.Context, in *GetTrackingIdRequest, opts ...grpc.CallOption) (*GetTrackingIdResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetTrackingIdResponse)
+	err := c.cc.Invoke(ctx, ShippingService_GetTrackingId_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ShippingServiceServer is the server API for ShippingService service.
 // All implementations must embed UnimplementedShippingServiceServer
 // for forward compatibility.
 type ShippingServiceServer interface {
 	GetQuote(context.Context, *GetQuoteRequest) (*GetQuoteResponse, error)
 	ShipOrder(context.Context, *ShipOrderRequest) (*ShipOrderResponse, error)
+	GetTrackingId(context.Context, *GetTrackingIdRequest) (*GetTrackingIdResponse, error)
 	mustEmbedUnimplementedShippingServiceServer()
 }
 
@@ -590,6 +641,9 @@ func (UnimplementedShippingServiceServer) GetQuote(context.Context, *GetQuoteReq
 }
 func (UnimplementedShippingServiceServer) ShipOrder(context.Context, *ShipOrderRequest) (*ShipOrderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ShipOrder not implemented")
+}
+func (UnimplementedShippingServiceServer) GetTrackingId(context.Context, *GetTrackingIdRequest) (*GetTrackingIdResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetTrackingId not implemented")
 }
 func (UnimplementedShippingServiceServer) mustEmbedUnimplementedShippingServiceServer() {}
 func (UnimplementedShippingServiceServer) testEmbeddedByValue()                         {}
@@ -648,6 +702,24 @@ func _ShippingService_ShipOrder_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ShippingService_GetTrackingId_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetTrackingIdRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ShippingServiceServer).GetTrackingId(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ShippingService_GetTrackingId_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ShippingServiceServer).GetTrackingId(ctx, req.(*GetTrackingIdRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ShippingService_ServiceDesc is the grpc.ServiceDesc for ShippingService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -662,6 +734,10 @@ var ShippingService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ShipOrder",
 			Handler:    _ShippingService_ShipOrder_Handler,
+		},
+		{
+			MethodName: "GetTrackingId",
+			Handler:    _ShippingService_GetTrackingId_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
@@ -809,7 +885,8 @@ var CurrencyService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	PaymentService_Charge_FullMethodName = "/hipstershop.PaymentService/Charge"
+	PaymentService_Charge_FullMethodName    = "/hipstershop.PaymentService/Charge"
+	PaymentService_GetCharge_FullMethodName = "/hipstershop.PaymentService/GetCharge"
 )
 
 // PaymentServiceClient is the client API for PaymentService service.
@@ -817,6 +894,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type PaymentServiceClient interface {
 	Charge(ctx context.Context, in *ChargeRequest, opts ...grpc.CallOption) (*ChargeResponse, error)
+	GetCharge(ctx context.Context, in *GetChargeRequest, opts ...grpc.CallOption) (*ChargeResponse, error)
 }
 
 type paymentServiceClient struct {
@@ -837,11 +915,22 @@ func (c *paymentServiceClient) Charge(ctx context.Context, in *ChargeRequest, op
 	return out, nil
 }
 
+func (c *paymentServiceClient) GetCharge(ctx context.Context, in *GetChargeRequest, opts ...grpc.CallOption) (*ChargeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ChargeResponse)
+	err := c.cc.Invoke(ctx, PaymentService_GetCharge_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // PaymentServiceServer is the server API for PaymentService service.
 // All implementations must embed UnimplementedPaymentServiceServer
 // for forward compatibility.
 type PaymentServiceServer interface {
 	Charge(context.Context, *ChargeRequest) (*ChargeResponse, error)
+	GetCharge(context.Context, *GetChargeRequest) (*ChargeResponse, error)
 	mustEmbedUnimplementedPaymentServiceServer()
 }
 
@@ -854,6 +943,9 @@ type UnimplementedPaymentServiceServer struct{}
 
 func (UnimplementedPaymentServiceServer) Charge(context.Context, *ChargeRequest) (*ChargeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Charge not implemented")
+}
+func (UnimplementedPaymentServiceServer) GetCharge(context.Context, *GetChargeRequest) (*ChargeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetCharge not implemented")
 }
 func (UnimplementedPaymentServiceServer) mustEmbedUnimplementedPaymentServiceServer() {}
 func (UnimplementedPaymentServiceServer) testEmbeddedByValue()                        {}
@@ -894,6 +986,24 @@ func _PaymentService_Charge_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PaymentService_GetCharge_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetChargeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PaymentServiceServer).GetCharge(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PaymentService_GetCharge_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PaymentServiceServer).GetCharge(ctx, req.(*GetChargeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // PaymentService_ServiceDesc is the grpc.ServiceDesc for PaymentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -904,6 +1014,10 @@ var PaymentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Charge",
 			Handler:    _PaymentService_Charge_Handler,
+		},
+		{
+			MethodName: "GetCharge",
+			Handler:    _PaymentService_GetCharge_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
@@ -1217,9 +1331,10 @@ var AdService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	UserService_Register_FullMethodName    = "/hipstershop.UserService/Register"
-	UserService_Login_FullMethodName       = "/hipstershop.UserService/Login"
-	UserService_VerifyToken_FullMethodName = "/hipstershop.UserService/VerifyToken"
+	UserService_Register_FullMethodName     = "/hipstershop.UserService/Register"
+	UserService_Login_FullMethodName        = "/hipstershop.UserService/Login"
+	UserService_VerifyToken_FullMethodName  = "/hipstershop.UserService/VerifyToken"
+	UserService_RefreshToken_FullMethodName = "/hipstershop.UserService/RefreshToken"
 )
 
 // UserServiceClient is the client API for UserService service.
@@ -1231,6 +1346,7 @@ type UserServiceClient interface {
 	Register(ctx context.Context, in *RegisterRequest, opts ...grpc.CallOption) (*RegisterResponse, error)
 	Login(ctx context.Context, in *LoginRequest, opts ...grpc.CallOption) (*LoginResponse, error)
 	VerifyToken(ctx context.Context, in *VerifyTokenRequest, opts ...grpc.CallOption) (*VerifyTokenResponse, error)
+	RefreshToken(ctx context.Context, in *RefreshTokenRequest, opts ...grpc.CallOption) (*RefreshTokenResponse, error)
 }
 
 type userServiceClient struct {
@@ -1271,6 +1387,16 @@ func (c *userServiceClient) VerifyToken(ctx context.Context, in *VerifyTokenRequ
 	return out, nil
 }
 
+func (c *userServiceClient) RefreshToken(ctx context.Context, in *RefreshTokenRequest, opts ...grpc.CallOption) (*RefreshTokenResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RefreshTokenResponse)
+	err := c.cc.Invoke(ctx, UserService_RefreshToken_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // UserServiceServer is the server API for UserService service.
 // All implementations must embed UnimplementedUserServiceServer
 // for forward compatibility.
@@ -1280,6 +1406,7 @@ type UserServiceServer interface {
 	Register(context.Context, *RegisterRequest) (*RegisterResponse, error)
 	Login(context.Context, *LoginRequest) (*LoginResponse, error)
 	VerifyToken(context.Context, *VerifyTokenRequest) (*VerifyTokenResponse, error)
+	RefreshToken(context.Context, *RefreshTokenRequest) (*RefreshTokenResponse, error)
 	mustEmbedUnimplementedUserServiceServer()
 }
 
@@ -1298,6 +1425,9 @@ func (UnimplementedUserServiceServer) Login(context.Context, *LoginRequest) (*Lo
 }
 func (UnimplementedUserServiceServer) VerifyToken(context.Context, *VerifyTokenRequest) (*VerifyTokenResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method VerifyToken not implemented")
+}
+func (UnimplementedUserServiceServer) RefreshToken(context.Context, *RefreshTokenRequest) (*RefreshTokenResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RefreshToken not implemented")
 }
 func (UnimplementedUserServiceServer) mustEmbedUnimplementedUserServiceServer() {}
 func (UnimplementedUserServiceServer) testEmbeddedByValue()                     {}
@@ -1374,6 +1504,24 @@ func _UserService_VerifyToken_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _UserService_RefreshToken_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RefreshTokenRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(UserServiceServer).RefreshToken(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: UserService_RefreshToken_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(UserServiceServer).RefreshToken(ctx, req.(*RefreshTokenRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // UserService_ServiceDesc is the grpc.ServiceDesc for UserService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1392,6 +1540,230 @@ var UserService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "VerifyToken",
 			Handler:    _UserService_VerifyToken_Handler,
+		},
+		{
+			MethodName: "RefreshToken",
+			Handler:    _UserService_RefreshToken_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "demo.proto",
+}
+
+const (
+	OrderService_CreateOrder_FullMethodName               = "/hipstershop.OrderService/CreateOrder"
+	OrderService_CancelOrderWithoutPayment_FullMethodName = "/hipstershop.OrderService/CancelOrderWithoutPayment"
+	OrderService_GetOrder_FullMethodName                  = "/hipstershop.OrderService/GetOrder"
+	OrderService_ListOrders_FullMethodName                = "/hipstershop.OrderService/ListOrders"
+)
+
+// OrderServiceClient is the client API for OrderService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// ---------------Order service----------------
+type OrderServiceClient interface {
+	CreateOrder(ctx context.Context, in *CreateOrderRequest, opts ...grpc.CallOption) (*CreateOrderResponse, error)
+	CancelOrderWithoutPayment(ctx context.Context, in *CancelOrderRequest, opts ...grpc.CallOption) (*CancelOrderResponse, error)
+	GetOrder(ctx context.Context, in *GetOrderRequest, opts ...grpc.CallOption) (*GetOrderResponse, error)
+	ListOrders(ctx context.Context, in *ListOrdersRequest, opts ...grpc.CallOption) (*ListOrdersResponse, error)
+}
+
+type orderServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewOrderServiceClient(cc grpc.ClientConnInterface) OrderServiceClient {
+	return &orderServiceClient{cc}
+}
+
+func (c *orderServiceClient) CreateOrder(ctx context.Context, in *CreateOrderRequest, opts ...grpc.CallOption) (*CreateOrderResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateOrderResponse)
+	err := c.cc.Invoke(ctx, OrderService_CreateOrder_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *orderServiceClient) CancelOrderWithoutPayment(ctx context.Context, in *CancelOrderRequest, opts ...grpc.CallOption) (*CancelOrderResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CancelOrderResponse)
+	err := c.cc.Invoke(ctx, OrderService_CancelOrderWithoutPayment_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *orderServiceClient) GetOrder(ctx context.Context, in *GetOrderRequest, opts ...grpc.CallOption) (*GetOrderResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetOrderResponse)
+	err := c.cc.Invoke(ctx, OrderService_GetOrder_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *orderServiceClient) ListOrders(ctx context.Context, in *ListOrdersRequest, opts ...grpc.CallOption) (*ListOrdersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListOrdersResponse)
+	err := c.cc.Invoke(ctx, OrderService_ListOrders_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// OrderServiceServer is the server API for OrderService service.
+// All implementations must embed UnimplementedOrderServiceServer
+// for forward compatibility.
+//
+// ---------------Order service----------------
+type OrderServiceServer interface {
+	CreateOrder(context.Context, *CreateOrderRequest) (*CreateOrderResponse, error)
+	CancelOrderWithoutPayment(context.Context, *CancelOrderRequest) (*CancelOrderResponse, error)
+	GetOrder(context.Context, *GetOrderRequest) (*GetOrderResponse, error)
+	ListOrders(context.Context, *ListOrdersRequest) (*ListOrdersResponse, error)
+	mustEmbedUnimplementedOrderServiceServer()
+}
+
+// UnimplementedOrderServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedOrderServiceServer struct{}
+
+func (UnimplementedOrderServiceServer) CreateOrder(context.Context, *CreateOrderRequest) (*CreateOrderResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateOrder not implemented")
+}
+func (UnimplementedOrderServiceServer) CancelOrderWithoutPayment(context.Context, *CancelOrderRequest) (*CancelOrderResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CancelOrderWithoutPayment not implemented")
+}
+func (UnimplementedOrderServiceServer) GetOrder(context.Context, *GetOrderRequest) (*GetOrderResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetOrder not implemented")
+}
+func (UnimplementedOrderServiceServer) ListOrders(context.Context, *ListOrdersRequest) (*ListOrdersResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListOrders not implemented")
+}
+func (UnimplementedOrderServiceServer) mustEmbedUnimplementedOrderServiceServer() {}
+func (UnimplementedOrderServiceServer) testEmbeddedByValue()                      {}
+
+// UnsafeOrderServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to OrderServiceServer will
+// result in compilation errors.
+type UnsafeOrderServiceServer interface {
+	mustEmbedUnimplementedOrderServiceServer()
+}
+
+func RegisterOrderServiceServer(s grpc.ServiceRegistrar, srv OrderServiceServer) {
+	// If the following call panics, it indicates UnimplementedOrderServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&OrderService_ServiceDesc, srv)
+}
+
+func _OrderService_CreateOrder_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateOrderRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OrderServiceServer).CreateOrder(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OrderService_CreateOrder_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OrderServiceServer).CreateOrder(ctx, req.(*CreateOrderRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OrderService_CancelOrderWithoutPayment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CancelOrderRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OrderServiceServer).CancelOrderWithoutPayment(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OrderService_CancelOrderWithoutPayment_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OrderServiceServer).CancelOrderWithoutPayment(ctx, req.(*CancelOrderRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OrderService_GetOrder_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetOrderRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OrderServiceServer).GetOrder(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OrderService_GetOrder_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OrderServiceServer).GetOrder(ctx, req.(*GetOrderRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OrderService_ListOrders_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListOrdersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OrderServiceServer).ListOrders(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OrderService_ListOrders_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OrderServiceServer).ListOrders(ctx, req.(*ListOrdersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// OrderService_ServiceDesc is the grpc.ServiceDesc for OrderService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var OrderService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "hipstershop.OrderService",
+	HandlerType: (*OrderServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "CreateOrder",
+			Handler:    _OrderService_CreateOrder_Handler,
+		},
+		{
+			MethodName: "CancelOrderWithoutPayment",
+			Handler:    _OrderService_CancelOrderWithoutPayment_Handler,
+		},
+		{
+			MethodName: "GetOrder",
+			Handler:    _OrderService_GetOrder_Handler,
+		},
+		{
+			MethodName: "ListOrders",
+			Handler:    _OrderService_ListOrders_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
