@@ -30,6 +30,7 @@ import (
 
 	pb "github.com/GoogleCloudPlatform/microservices-demo/src/checkoutservice/genproto"
 	money "github.com/GoogleCloudPlatform/microservices-demo/src/checkoutservice/money"
+	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
@@ -37,6 +38,11 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 )
 
 const (
@@ -87,8 +93,16 @@ func main() {
 		log.Info("Tracing enabled.")
 		initTracing()
 
-	} else {
-		log.Info("Tracing disabled.")
+		mp, err := initMetrics(ctx)
+		if err != nil {
+			log.Warnf("warn: failed to start metric provider: %+v", err)
+		} else {
+			defer func() {
+				if err := mp.Shutdown(context.Background()); err != nil {
+					log.Errorf("Error shutting down metric provider: %v", err)
+				}
+			}()
+		}
 	}
 
 	if os.Getenv("ENABLE_PROFILER") == "1" {
@@ -132,12 +146,12 @@ func main() {
 		propagation.NewCompositeTextMapPropagator(
 			propagation.TraceContext{}, propagation.Baggage{}))
 	srv = grpc.NewServer(
-		grpc.UnaryInterceptor(otelgrpc.UnaryServerInterceptor()),
-		grpc.StreamInterceptor(otelgrpc.StreamServerInterceptor()),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 	)
 
 	pb.RegisterCheckoutServiceServer(srv, svc)
-	healthpb.RegisterHealthServer(srv, svc)
+	healthServer := health.NewServer()
+	healthpb.RegisterHealthServer(srv, healthServer)
 	log.Infof("starting to listen on tcp: %q", lis.Addr().String())
 	err = srv.Serve(lis)
 	log.Fatal(err)
@@ -166,11 +180,53 @@ func initTracing() {
 	if err != nil {
 		log.Warnf("warn: Failed to create trace exporter: %v", err)
 	}
+	res, _ := resource.New(ctx,
+		resource.WithAttributes(
+			// 核心：在 Jaeger 里显示的服务名
+			semconv.ServiceNameKey.String("checkoutservice"),
+			semconv.ServiceVersionKey.String("1.0.0"),
+			semconv.DeploymentEnvironmentKey.String("production"),
+		),
+	)
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
-		sdktrace.WithSampler(sdktrace.AlwaysSample()))
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithResource(res))
 	otel.SetTracerProvider(tp)
 
+}
+
+func initMetrics(ctx context.Context) (*sdkmetric.MeterProvider, error) {
+	var (
+		collectorAddr string
+		collectorConn *grpc.ClientConn
+	)
+
+	mustMapEnv(&collectorAddr, "COLLECTOR_SERVICE_ADDR")
+	mustConnGRPC(ctx, &collectorConn, collectorAddr)
+
+	exporter, err := otlpmetricgrpc.New(
+		ctx,
+		otlpmetricgrpc.WithInsecure(),
+		otlpmetricgrpc.WithEndpoint(collectorAddr),
+	)
+	if err != nil {
+		log.Warnf("warn: Failed to create metric exporter: %v", err)
+	}
+
+	reader := sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(15*time.Second))
+	res, err := resource.New(ctx,
+		resource.WithAttributes(semconv.ServiceNameKey.String("checkoutservice")),
+	)
+	if err != nil {
+		log.Warnf("warn: Failed to create resource: %v", err)
+	}
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithResource(res),
+	)
+	otel.SetMeterProvider(mp)
+	return mp, nil
 }
 
 func initProfiling(service, version string) {
@@ -209,8 +265,7 @@ func mustConnGRPC(ctx context.Context, conn **grpc.ClientConn, addr string) {
 	defer cancel()
 	*conn, err = grpc.DialContext(ctx, addr,
 		grpc.WithInsecure(),
-		grpc.WithUnaryInterceptor(otelgrpc.UnaryClientInterceptor()),
-		grpc.WithStreamInterceptor(otelgrpc.StreamClientInterceptor()))
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 	if err != nil {
 		panic(errors.Wrapf(err, "grpc: failed to connect %s", addr))
 	}
@@ -396,14 +451,4 @@ func (cs *checkoutService) sendOrderConfirmation(ctx context.Context, email stri
 		Email: email,
 		Order: order})
 	return err
-}
-
-func (cs *checkoutService) shipOrder(ctx context.Context, address *pb.Address, items []*pb.CartItem) (string, error) {
-	resp, err := pb.NewShippingServiceClient(cs.shippingSvcConn).ShipOrder(ctx, &pb.ShipOrderRequest{
-		Address: address,
-		Items:   items})
-	if err != nil {
-		return "", fmt.Errorf("shipment failed: %+v", err)
-	}
-	return resp.GetTrackingId(), nil
 }

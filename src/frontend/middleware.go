@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -178,13 +179,30 @@ func NewRedisLimiter(log *logrus.Logger) *Limiter {
 		})
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
-	defer cancel()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Warnf("failed to connect to redis: %v", err)
-		return nil
+	// 带重试的 Redis 连接
+	maxRetries := 10
+	for i := 0; i < maxRetries; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err := rdb.Ping(ctx).Err()
+		cancel()
+
+		if err == nil {
+			log.Info("connected to redis")
+			break
+		}
+
+		if i == maxRetries-1 {
+			log.Warnf("failed to connect to redis after %d retries: %v, rate limiter disabled", maxRetries, err)
+			return nil
+		}
+
+		backoff := time.Duration(1<<i) * time.Second
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+		log.Warnf("redis not ready, retry in %v... (%d/%d)", backoff, i+1, maxRetries)
+		time.Sleep(backoff)
 	}
-	log.Info("connected to redis")
 
 	return &Limiter{
 		client: rdb,
@@ -206,17 +224,18 @@ func (l *Limiter) Allow(ctx context.Context, key string, capacity int, rate floa
 }
 
 func (l *Limiter) GlobalAndIPLimiter(next http.Handler) http.HandlerFunc {
-	globalRate := 1000.0
-	globalBurst := 1000
-
-	ipRate := 5.0
-	ipBurst := 10
-
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 200*time.Millisecond)
 		defer cancel()
 
 		ip := getRealIP(r)
+
+		// Env vars with defaults: RATE_LIMIT_{TYPE}_{RPS|BURST}
+		globalRate := getEnvFloat("RATELIMIT_GLOBAL_RPS", 1000.0)
+		globalBurst := getEnvInt("RATELIMIT_GLOBAL_BURST", 1000)
+
+		ipRate := getEnvFloat("RATELIMIT_IP_RPS", 5.0)
+		ipBurst := getEnvInt("RATELIMIT_IP_BURST", 10)
 
 		globalAllowed, err := l.Allow(ctx, "global_frontend", globalBurst, globalRate)
 		if err != nil {
@@ -287,4 +306,22 @@ func getUserID(r *http.Request) string {
 		return uid
 	}
 	return ""
+}
+
+func getEnvFloat(key string, defaultVal float64) float64 {
+	if val, ok := os.LookupEnv(key); ok {
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			return f
+		}
+	}
+	return defaultVal
+}
+
+func getEnvInt(key string, defaultVal int) int {
+	if val, ok := os.LookupEnv(key); ok {
+		if i, err := strconv.Atoi(val); err == nil {
+			return i
+		}
+	}
+	return defaultVal
 }

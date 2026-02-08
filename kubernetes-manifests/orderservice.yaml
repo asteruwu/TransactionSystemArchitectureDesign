@@ -1,0 +1,99 @@
+# Copyright 2018 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orderservice
+  labels:
+    app: orderservice
+spec:
+  selector:
+    matchLabels:
+      app: orderservice
+  template:
+    metadata:
+      labels:
+        app: orderservice
+    spec:
+      serviceAccountName: orderservice
+      terminationGracePeriodSeconds: 5
+      securityContext:
+        fsGroup: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+      - name: server
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          privileged: false
+          readOnlyRootFilesystem: true
+        image: orderservice
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 50057
+        env:
+        - name: PORT
+          value: "50057"
+        - name: ENABLE_TRACING
+          value: "1"
+        - name: COLLECTOR_SERVICE_ADDR
+          value: "otel-collector.default.svc.cluster.local:4317"
+        - name: MYSQL_ADDR
+          value: "root:root_password@tcp(mysql-service:3306)/order_db"
+        - name: PAYMENT_SERVICE_ADDR
+          value: "paymentservice:50051"
+        - name: SHIPPING_SERVICE_ADDR
+          value: "shippingservice:50051"
+        - name: ROCKETMQ_NAMESERVER
+          value: "rocketmq-namesrv.default.svc.cluster.local:9876"
+        - name: PRODUCT_CATALOG_SERVICE_ADDR
+          value: "productcatalogservice:3550"
+        readinessProbe:
+          grpc:
+            port: 50057
+        livenessProbe:
+          grpc:
+            port: 50057
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orderservice
+  labels:
+    app: orderservice
+spec:
+  type: ClusterIP
+  selector:
+    app: orderservice
+  ports:
+  - name: grpc
+    port: 50057
+    targetPort: 50057
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orderservice

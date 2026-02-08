@@ -1,0 +1,20 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rocketmq-init-job
+spec:
+  template:
+    spec:
+      containers:
+      - name: init-topics
+        image: apache/rocketmq:5.1.0
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "Waiting for NameServer..."
+            until ./mqadmin clusterList -n rocketmq-namesrv:9876; do sleep 5; done
+            echo "Creating topics..."
+            ./mqadmin updateTopic -n rocketmq-namesrv:9876 -t orders -c DefaultCluster
+            ./mqadmin updateTopic -n rocketmq-namesrv:9876 -t order_status_events -c DefaultCluster
+            echo "Topics created successfully."
+      restartPolicy: OnFailure

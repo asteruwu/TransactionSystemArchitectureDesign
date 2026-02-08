@@ -1,0 +1,127 @@
+# Copyright 2018 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# RocketMQ NameServer Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rocketmq-namesrv
+  labels:
+    app: rocketmq-namesrv
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rocketmq-namesrv
+  template:
+    metadata:
+      labels:
+        app: rocketmq-namesrv
+    spec:
+      containers:
+      - name: namesrv
+        image: apache/rocketmq:5.1.0
+        command: ["sh", "-c", "./mqnamesrv"]
+        ports:
+        - containerPort: 9876
+        env:
+        - name: JAVA_OPT_EXT
+          value: "-Xms256m -Xmx256m -Xmn128m"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rocketmq-namesrv
+  labels:
+    app: rocketmq-namesrv
+spec:
+  type: ClusterIP
+  selector:
+    app: rocketmq-namesrv
+  ports:
+  - name: namesrv
+    port: 9876
+    targetPort: 9876
+---
+# RocketMQ Broker Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rocketmq-broker
+  labels:
+    app: rocketmq-broker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rocketmq-broker
+  template:
+    metadata:
+      labels:
+        app: rocketmq-broker
+    spec:
+      containers:
+      - name: broker
+        image: apache/rocketmq:5.1.0
+        command: ["sh", "-c", "./mqbroker -n rocketmq-namesrv:9876 autoCreateTopicEnable=true"]
+        ports:
+        - containerPort: 10909
+        - containerPort: 10911
+        - containerPort: 10912
+        env:
+        - name: JAVA_OPT_EXT
+          value: "-Xms256m -Xmx256m -Xmn128m"
+        - name: NAMESRV_ADDR
+          value: "rocketmq-namesrv:9876"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        volumeMounts:
+        - name: broker-storage
+          mountPath: /home/rocketmq/store
+      volumes:
+      - name: broker-storage
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rocketmq-broker
+  labels:
+    app: rocketmq-broker
+spec:
+  type: ClusterIP
+  selector:
+    app: rocketmq-broker
+  ports:
+  - name: vip
+    port: 10909
+    targetPort: 10909
+  - name: main
+    port: 10911
+    targetPort: 10911
+  - name: ha
+    port: 10912
+    targetPort: 10912

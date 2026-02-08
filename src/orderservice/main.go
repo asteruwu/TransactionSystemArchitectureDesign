@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"os/signal"
@@ -19,13 +20,27 @@ import (
 	pb "github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/genproto"
 	rocketmq "github.com/apache/rocketmq-client-go/v2"
 	"github.com/apache/rocketmq-client-go/v2/producer"
-	redis "github.com/redis/go-redis/v9"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+
+	// Tracing
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+
+	// Metrics
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
 )
 
 var log *logrus.Logger
@@ -48,7 +63,32 @@ func main() {
 	defer cancel()
 	wg := &sync.WaitGroup{}
 
-	repo, rdb := initDB()
+	// 1. Init Tracing & Metrics (Optional)
+	if os.Getenv("ENABLE_TRACING") == "1" {
+		tp, err := initTracing(ctx)
+		if err != nil {
+			log.Warnf("warn: failed to start tracer: %+v", err)
+		} else {
+			defer func() {
+				if err := tp.Shutdown(context.Background()); err != nil {
+					log.Errorf("Error shutting down tracer provider: %v", err)
+				}
+			}()
+		}
+
+		mp, err := initMetrics(ctx)
+		if err != nil {
+			log.Warnf("warn: failed to start metric provider: %+v", err)
+		} else {
+			defer func() {
+				if err := mp.Shutdown(context.Background()); err != nil {
+					log.Errorf("Error shutting down metric provider: %v", err)
+				}
+			}()
+		}
+	}
+
+	repo := initDB()
 
 	// Init RocketMQ Producer
 	rocketmqAddr := os.Getenv("ROCKETMQ_NAMESERVER")
@@ -105,12 +145,8 @@ func main() {
 	}
 	shippingClient := pb.NewShippingServiceClient(shippingConn)
 
-	// 5. Start Redis Stream Worker (上游)
-	streamWorker := worker.NewStreamWorker(rdb, p, log)
-	streamWorker.Start(ctx, wg)
-
-	// 6. Start RocketMQ Consumer (下游)
-	consumerWorker, err := worker.NewConsumerWorker([]string{resolvedAddr}, "order_db_group", p, repo, log)
+	// 5. Start RocketMQ Consumer (订单创建 - 由 ProductCatalog Forwarder 转发)
+	consumerWorker, err := worker.NewConsumerWorker([]string{resolvedAddr}, "order_db_group", p, repo, shippingClient, log)
 	if err != nil {
 		log.Fatalf("Failed to init consumer: %v", err)
 	}
@@ -118,7 +154,7 @@ func main() {
 	go consumerWorker.Start(ctx, wg, "orders")
 
 	// 7. Start RocketMQ Status Consumer
-	statusConsumerWorker, err := worker.NewConsumerWorker([]string{resolvedAddr}, "order_status_group", p, repo, log)
+	statusConsumerWorker, err := worker.NewConsumerWorker([]string{resolvedAddr}, "order_status_group", p, repo, shippingClient, log)
 	if err != nil {
 		log.Fatalf("Failed to init status consumer: %v", err)
 	}
@@ -147,28 +183,31 @@ func main() {
 	shippingRecoverWorker := worker.NewShippingRecoverWorker(repo, shippingClient, log)
 	go shippingRecoverWorker.Start(ctx, wg)
 
-	// [New] Init Shipment Flusher
-	shipmentFlusher := worker.NewShipmentFlusher(repo, log)
-	shipmentFlusher.Start(ctx, wg)
-
 	// 11. Start gRPC Server
-	orderSvc := service.NewOrderService(catalogClient, paymentClient, shippingClient, p, repo, shipmentFlusher)
+	orderSvc := service.NewOrderService(catalogClient, paymentClient, shippingClient, p, repo)
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "50051"
 	}
 	lis, _ := net.Listen("tcp", ":"+port)
-	s := grpc.NewServer()
-	pb.RegisterOrderServiceServer(s, orderSvc)
+
+	otel.SetTextMapPropagator(
+		propagation.NewCompositeTextMapPropagator(
+			propagation.TraceContext{}, propagation.Baggage{}))
+
+	srv := grpc.NewServer(
+		grpc.StatsHandler(otelgrpc.NewServerHandler()))
+
+	pb.RegisterOrderServiceServer(srv, orderSvc)
 
 	// 注册 gRPC Health Service (K8s 健康检查需要)
 	healthServer := health.NewServer()
-	healthpb.RegisterHealthServer(s, healthServer)
+	healthpb.RegisterHealthServer(srv, healthServer)
 	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 
 	log.Infof("OrderService started on :%s", port)
-	s.Serve(lis)
+	go srv.Serve(lis)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -176,14 +215,14 @@ func main() {
 	<-sigCh
 	log.Info("Gracefully shutting down...")
 
-	s.GracefulStop()
+	srv.GracefulStop()
 	// Notify workers to stop
 	cancel()
 	// Wait for workers to cleanup
 	wg.Wait()
 }
 
-func initDB() (repository.OrderRepo, *redis.Client) {
+func initDB() repository.OrderRepo {
 	mysqlAddr := os.Getenv("MYSQL_ADDR")
 	if mysqlAddr == "" {
 		mysqlAddr = "root:root_password@tcp(127.0.0.1:3307)/product_db"
@@ -208,39 +247,97 @@ func initDB() (repository.OrderRepo, *redis.Client) {
 	repo := repository.NewOrderRepo(db)
 	log.Info("connected to mysql")
 
-	var rdb *redis.Client
-	sentinelAddrs := os.Getenv("REDIS_SENTINEL_ADDRS")
+	return repo
+}
 
-	if sentinelAddrs != "" {
-		// [模式 A] 哨兵模式 (生产环境/K8s)
-		log.Infof("Initializing Redis in Sentinel Mode. Sentinels: %s", sentinelAddrs)
+func initTracing(ctx context.Context) (*sdktrace.TracerProvider, error) {
+	var (
+		collectorAddr string
+		collectorConn *grpc.ClientConn
+	)
 
-		rdb = redis.NewFailoverClient(&redis.FailoverOptions{
-			MasterName:    "mymaster",
-			SentinelAddrs: strings.Split(sentinelAddrs, ","),
-			DB:            0,
-		})
-	} else {
-		// [模式 B] 单机模式 (本地开发/旧环境)
-		redisAddr := os.Getenv("REDIS_ADDR")
-		if redisAddr == "" {
-			redisAddr = "localhost:6380" // 本地默认
-		}
-		log.Infof("Initializing Redis in Single Node Mode. Addr: %s", redisAddr)
+	mustMapEnv(&collectorAddr, "COLLECTOR_SERVICE_ADDR")
+	mustConnGRPC(ctx, &collectorConn, collectorAddr)
 
-		rdb = redis.NewClient(&redis.Options{
-			Addr: redisAddr,
-		})
+	exporter, err := otlptracegrpc.New(
+		ctx,
+		otlptracegrpc.WithGRPCConn(collectorConn))
+	if err != nil {
+		log.Warnf("warn: Failed to create trace exporter: %v", err)
 	}
 
-	pingCtx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+	res, err := resource.New(ctx,
+		resource.WithAttributes(
+			// 核心：在 Jaeger 里显示的服务名
+			semconv.ServiceNameKey.String("orderservice"),
+			semconv.ServiceVersionKey.String("1.0.0"),
+			semconv.DeploymentEnvironmentKey.String("production"),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create resource: %w", err)
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(0.1))),
+		sdktrace.WithResource(res),
+	)
+	otel.SetTracerProvider(tp)
+	return tp, err
+}
+
+func initMetrics(ctx context.Context) (*sdkmetric.MeterProvider, error) {
+	var (
+		collectorAddr string
+		collectorConn *grpc.ClientConn
+	)
+
+	mustMapEnv(&collectorAddr, "COLLECTOR_SERVICE_ADDR")
+	mustConnGRPC(ctx, &collectorConn, collectorAddr)
+
+	exporter, err := otlpmetricgrpc.New(
+		ctx,
+		otlpmetricgrpc.WithInsecure(),
+		otlpmetricgrpc.WithEndpoint(collectorAddr),
+	)
+	if err != nil {
+		log.Warnf("warn: Failed to create metric exporter: %v", err)
+	}
+
+	reader := sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(15*time.Second))
+	res, err := resource.New(ctx,
+		resource.WithAttributes(semconv.ServiceNameKey.String("orderservice")),
+	)
+	if err != nil {
+		log.Warnf("warn: Failed to create resource: %v", err)
+	}
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithResource(res),
+	)
+	otel.SetMeterProvider(mp)
+	return mp, nil
+}
+
+func mustMapEnv(target *string, envKey string) {
+	v := os.Getenv(envKey)
+	if v == "" {
+		panic(fmt.Sprintf("environment variable %q not set", envKey))
+	}
+	*target = v
+}
+
+func mustConnGRPC(ctx context.Context, conn **grpc.ClientConn, addr string) {
+	var err error
+	ctx, cancel := context.WithTimeout(ctx, time.Second*3)
 	defer cancel()
-	if err := rdb.Ping(pingCtx).Err(); err != nil {
-		log.Warnf("failed to connect to redis: %v", err)
+	*conn, err = grpc.NewClient(addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
+	if err != nil {
+		panic(errors.Wrapf(err, "grpc: failed to connect %s", addr))
 	}
-	log.Info("connected to redis")
-
-	return repo, rdb
 }
 
 // resolveToIP 将 hostname:port 格式解析为 ip:port 格式

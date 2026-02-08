@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 
@@ -45,14 +46,13 @@ func (dc *DLQConsumer) Start(ctx context.Context, wg *sync.WaitGroup) error {
 		dc.Stop()
 	}()
 
-	// 订阅死信队列
-	// RocketMQ 默认的死信 Topic 格式为: %DLQ%ConsumerGroupName
-	// 我们的正常 Consumer Group 是 "OrderCreationConsumerGroup"
-	dlqTopic := "%DLQ%OrderCreationConsumerGroup"
-
-	err := dc.client.Subscribe(dlqTopic, consumer.MessageSelector{}, dc.consume)
-	if err != nil {
-		return err
+	// 订阅两个 Consumer Group 对应的 DLQ
+	// PushConsumer 支持多次 Subscribe()，每个 Topic 共用同一个 consume() 回调
+	dlqTopics := []string{"%DLQ%order_db_group", "%DLQ%order_status_group"}
+	for _, topic := range dlqTopics {
+		if err := dc.client.Subscribe(topic, consumer.MessageSelector{}, dc.consume); err != nil {
+			return fmt.Errorf("failed to subscribe DLQ topic %s: %w", topic, err)
+		}
 	}
 
 	return dc.client.Start()

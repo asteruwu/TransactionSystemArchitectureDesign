@@ -24,7 +24,7 @@ func NewShippingRecoverWorker(repo repository.OrderRepo, shippingClient pb.Shipp
 		repo:           repo,
 		shippingClient: shippingClient,
 		log:            log.WithField("worker", "ShippingRecoverWorker"),
-		interval:       1 * time.Minute,
+		interval:       10 * time.Second,
 	}
 }
 

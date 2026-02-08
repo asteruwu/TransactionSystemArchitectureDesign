@@ -60,14 +60,28 @@ func NewCartRedis() (*CartRedis, error) {
 		})
 	}
 
-	// 3. 测试连接
-	// 使用带超时的 Context 防止连不上一直卡住
-	_, cancel := context.WithTimeout(context.Background(), time.Second*3) // 伪代码修正：这里应该是 time.Second
-	// 修正：你需要 import "time" 才能用 time.Second，或者直接用 context.Background() 简单测试
-	// 为了不引入新包，我们简单点直接 Ping
-	defer cancel()
-	if err := rdb.Ping(context.Background()).Err(); err != nil {
-		return nil, fmt.Errorf("failed to connect to redis: %w", err)
+	// 带重试的 Redis 连接
+	maxRetries := 10
+	for i := 0; i < maxRetries; i++ {
+		pingCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err := rdb.Ping(pingCtx).Err()
+		cancel()
+
+		if err == nil {
+			fmt.Println("connected to redis")
+			break
+		}
+
+		if i == maxRetries-1 {
+			return nil, fmt.Errorf("failed to connect to redis after %d retries: %w", maxRetries, err)
+		}
+
+		backoff := time.Duration(1<<i) * time.Second
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+		fmt.Printf("redis not ready, retry in %v... (%d/%d)\n", backoff, i+1, maxRetries)
+		time.Sleep(backoff)
 	}
 
 	return &CartRedis{rdb: rdb}, nil

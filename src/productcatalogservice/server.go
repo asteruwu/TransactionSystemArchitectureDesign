@@ -26,9 +26,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/GoogleCloudPlatform/microservices-demo/src/productcatalogservice/forwarder"
 	"github.com/GoogleCloudPlatform/microservices-demo/src/productcatalogservice/model"
 	"github.com/GoogleCloudPlatform/microservices-demo/src/productcatalogservice/repository"
 	"github.com/redis/go-redis/v9"
+
+	rocketmq "github.com/apache/rocketmq-client-go/v2"
+	"github.com/apache/rocketmq-client-go/v2/producer"
 
 	pb "github.com/GoogleCloudPlatform/microservices-demo/src/productcatalogservice/genproto"
 	"google.golang.org/grpc/credentials/insecure"
@@ -169,13 +173,43 @@ func run(port string, ctx context.Context, wg *sync.WaitGroup) (string, *grpc.Se
 	srv := grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()))
 
-	svc := &productCatalogService{repo: initDB(ctx, wg)}
+	repo, rdb := initDB(ctx, wg)
+	svc := &productCatalogService{repo: repo}
 
 	pb.RegisterProductCatalogServiceServer(srv, svc)
 	hsrv := health.NewServer()
 	hsrv.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 	healthpb.RegisterHealthServer(srv, hsrv)
 	reflection.Register(srv)
+
+	// 初始化 RocketMQ Producer (用于 Forwarder)
+	if rdb != nil {
+		rocketmqAddr := os.Getenv("ROCKETMQ_NAMESERVER")
+		if rocketmqAddr == "" {
+			rocketmqAddr = "localhost:9876"
+		}
+
+		// RocketMQ Go 客户端不支持主机名，需要解析为 IP 地址
+		resolvedAddr := resolveToIP(rocketmqAddr)
+		log.Infof("RocketMQ NameServer: %s -> %s", rocketmqAddr, resolvedAddr)
+
+		mqProducer, err := rocketmq.NewProducer(
+			producer.WithNameServer([]string{resolvedAddr}),
+			producer.WithGroupName("ProductCatalog-Forwarder"),
+			producer.WithRetry(3),
+		)
+		if err != nil {
+			log.Warnf("Failed to create RocketMQ producer: %v (Forwarder disabled)", err)
+		} else {
+			if err := mqProducer.Start(); err != nil {
+				log.Warnf("Failed to start RocketMQ producer: %v (Forwarder disabled)", err)
+			} else {
+				log.Info("RocketMQ producer started, initializing Forwarder...")
+				fwd := forwarder.NewOrderForwarder(rdb, mqProducer, log)
+				fwd.Start(ctx, wg)
+			}
+		}
+	}
 
 	go srv.Serve(listener)
 
@@ -252,7 +286,7 @@ func initMetrics(ctx context.Context) (*sdkmetric.MeterProvider, error) {
 	return mp, nil
 }
 
-func initDB(ctx context.Context, wg *sync.WaitGroup) repository.ProductRepository {
+func initDB(ctx context.Context, wg *sync.WaitGroup) (repository.ProductRepository, *redis.Client) {
 	mysqlAddr := os.Getenv("MYSQL_ADDR")
 	if mysqlAddr == "" {
 		mysqlAddr = "root:root_password@tcp(127.0.0.1:3307)/product_db"
@@ -302,17 +336,34 @@ func initDB(ctx context.Context, wg *sync.WaitGroup) repository.ProductRepositor
 		panic(err)
 	}
 
-	pingCtx, cancel := context.WithTimeout(context.Background(), time.Second*3)
-	defer cancel()
-	if err := rdb.Ping(pingCtx).Err(); err != nil {
-		log.Warnf("failed to connect to redis: %v", err)
-		return baserepo
+	// 带重试的 Redis 连接
+	maxRetries := 10
+	for i := 0; i < maxRetries; i++ {
+		pingCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err := rdb.Ping(pingCtx).Err()
+		cancel()
+
+		if err == nil {
+			log.Info("connected to redis")
+			break
+		}
+
+		if i == maxRetries-1 {
+			log.Warnf("failed to connect to redis after %d retries: %v, using base repo", maxRetries, err)
+			return baserepo, nil
+		}
+
+		backoff := time.Duration(1<<i) * time.Second
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+		log.Warnf("redis not ready, retry in %v... (%d/%d)", backoff, i+1, maxRetries)
+		time.Sleep(backoff)
 	}
-	log.Info("connected to redis")
 
 	repo := repository.NewCachedRepo(baserepo, rdb, db, log, ctx, wg)
 
-	return repo
+	return repo, rdb
 }
 
 func initProfiling(service, version string) {
@@ -427,4 +478,34 @@ func modelToProto(p *model.Product) *pb.Product {
 		Categories: categories,
 		Stock:      p.Stock,
 	}
+}
+
+// resolveToIP 将 hostname:port 格式解析为 ip:port 格式
+// RocketMQ Go 客户端不支持主机名，需要先进行 DNS 解析
+func resolveToIP(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr // 无法解析则原样返回
+	}
+
+	// 检查是否已经是 IP 地址
+	if ip := net.ParseIP(host); ip != nil {
+		return addr // 已经是 IP，直接返回
+	}
+
+	// DNS 解析主机名
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return addr // 解析失败则原样返回
+	}
+
+	// 优先使用 IPv4 地址
+	for _, ip := range ips {
+		if ip4 := ip.To4(); ip4 != nil {
+			return net.JoinHostPort(ip4.String(), port)
+		}
+	}
+
+	// 没有 IPv4 则使用第一个 IP
+	return net.JoinHostPort(ips[0].String(), port)
 }

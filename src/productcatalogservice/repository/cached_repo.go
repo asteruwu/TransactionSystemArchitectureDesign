@@ -57,17 +57,23 @@ type StockDedupLog struct {
 }
 
 const LuaDeductStock = `
-	-- KEYS: [stockKey1, stockKey2, ..., stockStreamKey, orderStreamKey]
+	-- KEYS: [dedupKey, stockKey1, stockKey2, ..., stockStreamKey, orderStreamKey]
 	-- ARGV: [amount1, amount2, ..., stockPayload, orderPayload]
 
+	local dedupKey = KEYS[1]
 	local keyCount = #KEYS
 	local orderStreamKey = KEYS[keyCount]
 	local stockStreamKey = KEYS[keyCount-1]
-	local itemCount = keyCount - 2
+	local itemCount = keyCount - 3
+
+	-- 0. 幂等性检查 (Idempotency Check)
+	if redis.call('exists', dedupKey) == 1 then
+		return 2 -- 已处理过，直接返回成功
+	end
 
 	-- 1. 确认库存是否充足
 	for i = 1, itemCount do
-		local stockKey = KEYS[i]
+		local stockKey = KEYS[i+1]
 		local amount = tonumber(ARGV[i])
 		local current = tonumber(redis.call('get', stockKey))
 
@@ -81,17 +87,20 @@ const LuaDeductStock = `
 
 	-- 2. 扣减库存
 	for i = 1, itemCount do
-		redis.call('decrby', KEYS[i], ARGV[i])
+		redis.call('decrby', KEYS[i+1], ARGV[i])
 	end
 
-	-- 3. 发送消息
+	-- 3. 写入去重记录 (TTL 1小时)
+	redis.call('setex', dedupKey, 3600, '1')
+
+	-- 4. 发送消息
 	local stockPayload = ARGV[itemCount+1]
 	local orderPayload = ARGV[itemCount+2]
 
-	-- 3.1 发送库存流消息
+	-- 4.1 发送库存流消息
 	redis.call('xadd', stockStreamKey, '*', 'payload', stockPayload)
 
-	-- 3.2 发送订单流消息
+	-- 4.2 发送订单流消息
 	redis.call('xadd', orderStreamKey, '*', 'payload', orderPayload)
 
 	return 1 -- 成功
@@ -306,8 +315,12 @@ func (c *cachedRepo) SearchProducts(ctx context.Context, query string) ([]*model
 
 func (c *cachedRepo) ChargeProduct(ctx context.Context, req *pb.ChargeProductRequest) (bool, string) {
 	count := len(req.Items)
-	keys := make([]string, 0, count+2)
+	keys := make([]string, 0, count+3) // +3 for dedupKey, stockStreamKey, orderStreamKey
 	args := make([]interface{}, 0, count+2)
+
+	// 0. 幂等键 (Dedup Key)
+	dedupKey := fmt.Sprintf("dedup:charge:%s", req.OrderId)
+	keys = append(keys, dedupKey)
 
 	// 1. Stock Item
 	type stockItem struct {
@@ -394,7 +407,8 @@ func (c *cachedRepo) ChargeProduct(ctx context.Context, req *pb.ChargeProductReq
 			return false, err.Error()
 		}
 
-		if code == 1 {
+		if code == 1 || code == 2 {
+			// code 1 = 新扣减成功, code 2 = 幂等命中(已处理过)
 			return true, "Success"
 		}
 		if code == 0 {
@@ -412,7 +426,7 @@ func (c *cachedRepo) ChargeProduct(ctx context.Context, req *pb.ChargeProductReq
 				if err != nil {
 					return false, err.Error()
 				}
-				if code == 1 {
+				if code == 1 || code == 2 {
 					return true, "Success"
 				}
 				if code == 0 {

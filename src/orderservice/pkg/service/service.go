@@ -17,10 +17,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-type ShipmentPusher interface {
-	Push(s *model.Shipment)
-}
-
 type MQProducer interface {
 	SendSync(ctx context.Context, msgs ...*primitive.Message) (*primitive.SendResult, error)
 }
@@ -32,19 +28,17 @@ type OrderService struct {
 	shippingClient pb.ShippingServiceClient
 	producer       MQProducer
 	repo           repository.OrderRepo
-	shipmentPusher ShipmentPusher
 	rdb            *redis.Client
 }
 
 // 订单服务初始化
-func NewOrderService(catalogClient pb.ProductCatalogServiceClient, paymentClient pb.PaymentServiceClient, shippingClient pb.ShippingServiceClient, producer MQProducer, repo repository.OrderRepo, shipmentPusher ShipmentPusher) *OrderService {
+func NewOrderService(catalogClient pb.ProductCatalogServiceClient, paymentClient pb.PaymentServiceClient, shippingClient pb.ShippingServiceClient, producer MQProducer, repo repository.OrderRepo) *OrderService {
 	return &OrderService{
 		catalogClient:  catalogClient,
 		paymentClient:  paymentClient,
 		shippingClient: shippingClient,
 		producer:       producer,
 		repo:           repo,
-		shipmentPusher: shipmentPusher,
 	}
 }
 
@@ -99,52 +93,12 @@ func (s *OrderService) CreateOrder(ctx context.Context, req *pb.CreateOrderReque
 	// 5. 支付成功 -> 更新订单状态
 	s.sendOrderStatusEvent(ctx, orderID, "PAID")
 
-	// 6. 异步发货
-	go func() {
-		bgCtx := context.Background()
-		cartItems := extractCartItemsFromProto(req.Items)
-		// 常规路径
-		s.shipOrderHappyPath(bgCtx, orderID, req.Address, cartItems)
-	}()
-
-	// 7. 返回成功
+	// 6. 返回成功（发货由 MQ Consumer 驱动，失败由 ShippingRecoverWorker 补偿）
 	return &pb.CreateOrderResponse{
 		OrderId: orderID,
 		Success: true,
 		Message: "Order accepted",
 	}, nil
-}
-
-func (s *OrderService) shipOrderHappyPath(ctx context.Context, orderID string, address *pb.Address, items []*pb.CartItem) {
-	// rpc调用：发货
-	shipResp, err := s.shippingClient.ShipOrder(ctx, &pb.ShipOrderRequest{
-		Address: address,
-		Items:   items,
-		OrderId: orderID,
-	})
-
-	if err != nil {
-		logrus.Errorf("[HappyPath] ShipOrder failed for %s: %v. Will be handled by Recover Worker.", orderID, err)
-		return
-	}
-
-	// 准备状态更新数据
-	shipment := &model.Shipment{
-		OrderID:    orderID,
-		TrackingID: shipResp.TrackingId,
-		Status:     model.OrderStatusShipped,
-	}
-
-	if s.shipmentPusher != nil {
-		// 生产：发送到channel
-		s.shipmentPusher.Push(shipment)
-	} else {
-		// 降级：逐请求处理
-		err = s.repo.UpdateOrderAndInsertShipment(ctx, orderID, model.OrderStatusShipped, shipment)
-		if err != nil {
-			logrus.Errorf("[HappyPath] Failed to update DB for %s: %v. Recover Worker will fix idempotency.", orderID, err)
-		}
-	}
 }
 
 func (s *OrderService) sendOrderStatusEvent(ctx context.Context, orderID, status string) {

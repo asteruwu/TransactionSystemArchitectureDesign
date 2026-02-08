@@ -13,6 +13,7 @@ type OrderRepo interface {
 	InsertOrder(ctx context.Context, order *model.Order) error
 	InsertOrdersBatch(ctx context.Context, orders []*model.Order) error
 	GetOrder(ctx context.Context, orderID string) (*model.Order, error)
+	GetOrdersByIDs(ctx context.Context, orderIDs []string) ([]*model.Order, error)
 	UpdateOrderStatus(ctx context.Context, orderID string, status int32) error
 	GetExpiredPendingOrders(ctx context.Context, delay time.Duration, limit int) ([]*model.Order, error)
 	UpdateOrderStatusBatch(ctx context.Context, statuses map[string]int32) error
@@ -51,15 +52,30 @@ func (r *mysqlRepo) GetOrder(ctx context.Context, orderID string) (*model.Order,
 	return &order, nil
 }
 
+// [Shipping Consumer] 批量获取订单
+func (r *mysqlRepo) GetOrdersByIDs(ctx context.Context, orderIDs []string) ([]*model.Order, error) {
+	if len(orderIDs) == 0 {
+		return nil, nil
+	}
+	var orders []*model.Order
+	err := r.db.WithContext(ctx).
+		Preload("Items").
+		Where("order_id IN ?", orderIDs).
+		Find(&orders).Error
+	return orders, err
+}
+
 // [order_status Consumer] Batch更新失败，整批回滚，逐消息更新
 func (r *mysqlRepo) UpdateOrderStatus(ctx context.Context, orderID string, status int32) error {
-	res := r.db.WithContext(ctx).Model(&model.Order{}).Where("order_id = ?", orderID).Update("status", status)
+	// 防回滚：只有新状态大于当前状态时才更新
+	res := r.db.WithContext(ctx).Model(&model.Order{}).
+		Where("order_id = ? AND status < ?", orderID, status).
+		Update("status", status)
+
 	if res.Error != nil {
 		return res.Error
 	}
-	if res.RowsAffected == 0 {
-		return fmt.Errorf("order not found for update")
-	}
+	// 如果 RowsAffected == 0，说明状态已经是最新的（或者订单不存在），视为成功
 	return nil
 }
 
@@ -88,8 +104,8 @@ func (r *mysqlRepo) UpdateOrderStatusBatch(ctx context.Context, statuses map[str
 	params := make([]interface{}, 0, len(statuses)*2)
 
 	for oid, status := range statuses {
-		caseStmt += " WHEN ? THEN ?"
-		params = append(params, oid, status)
+		caseStmt += " WHEN ? THEN IF(status < ?, ?, status)"
+		params = append(params, oid, status, status)
 		ids = append(ids, oid)
 	}
 	caseStmt += " ELSE status END"
@@ -108,13 +124,19 @@ func (r *mysqlRepo) InsertFailedOrder(ctx context.Context, failedOrder *model.Fa
 // [Shippment Flusher / Shipping Recover] Batch处理失败，整批回滚，逐消息处理
 func (r *mysqlRepo) UpdateOrderAndInsertShipment(ctx context.Context, orderID string, status int32, shipment *model.Shipment) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 1. Update Order Status
-		res := tx.Model(&model.Order{}).Where("order_id = ?", orderID).Update("status", status)
+		// 1. Update Order Status (带防回滚条件：order 必须存在且状态小于目标状态)
+		res := tx.Model(&model.Order{}).Where("order_id = ? AND status < ?", orderID, status).Update("status", status)
 		if res.Error != nil {
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
-			return fmt.Errorf("order not found: %s", orderID)
+			// 检查订单是否存在
+			var count int64
+			tx.Model(&model.Order{}).Where("order_id = ?", orderID).Count(&count)
+			if count == 0 {
+				return fmt.Errorf("order not found: %s", orderID)
+			}
+			// 订单存在但状态已经是目标状态或更高，视为成功（幂等）
 		}
 
 		// 2. Insert Shipment
@@ -166,7 +188,15 @@ func (r *mysqlRepo) UpdateOrdersAndInsertShipmentsBatch(ctx context.Context, shi
 		query := fmt.Sprintf("UPDATE orders SET status = %s WHERE order_id IN ?", caseStmt)
 		params = append(params, ids)
 
-		return tx.Exec(query, params...).Error
+		result := tx.Exec(query, params...)
+		if result.Error != nil {
+			return result.Error
+		}
+		// 检查是否所有订单都被更新（订单必须存在）
+		if result.RowsAffected != int64(len(shipments)) {
+			return fmt.Errorf("not all orders updated, expected %d, got %d (some orders may not exist yet)", len(shipments), result.RowsAffected)
+		}
+		return nil
 	})
 }
 

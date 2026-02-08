@@ -1,0 +1,207 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-init-script
+data:
+  # 初始化脚本：包含建表和插入数据
+  init.sql: |
+    CREATE DATABASE IF NOT EXISTS product_db;
+    USE product_db;
+
+    -- 对应 Go 结构体的表结构
+    CREATE TABLE IF NOT EXISTS products (
+        id VARCHAR(255) PRIMARY KEY,
+        name VARCHAR(255),
+        description TEXT,
+        picture VARCHAR(255),
+        price_usd_currency_code VARCHAR(3),
+        price_usd_units BIGINT,
+        price_usd_nanos INT,
+        categories VARCHAR(255), 
+        stock INT DEFAULT 100
+    );
+
+    CREATE TABLE IF NOT EXISTS stock_dedup_log (
+        msg_id VARCHAR(64) NOT NULL COMMENT 'Redis Stream Message ID',
+        product_id VARCHAR(64) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (msg_id),
+        KEY idx_time (created_at)
+    );
+
+    -- 插入 JSON 中的数据 (默认库存设为 100)
+    -- 1. Sunglasses
+    INSERT INTO products (id, name, description, picture, price_usd_currency_code, price_usd_units, price_usd_nanos, categories, stock)
+    VALUES ('OLJCESPC7Z', 'Sunglasses', 'Add a modern touch to your outfits with these sleek aviator sunglasses.', '/static/img/products/sunglasses.jpg', 'USD', 19, 990000000, 'accessories', 100);
+
+    -- 2. Tank Top
+    INSERT INTO products (id, name, description, picture, price_usd_currency_code, price_usd_units, price_usd_nanos, categories, stock)
+    VALUES ('66VCHSJNUP', 'Tank Top', 'Perfectly cropped cotton tank, with a scooped neckline.', '/static/img/products/tank-top.jpg', 'USD', 18, 990000000, 'clothing,tops', 100);
+
+    -- 3. Watch
+    INSERT INTO products (id, name, description, picture, price_usd_currency_code, price_usd_units, price_usd_nanos, categories, stock)
+    VALUES ('1YMWWN1N4O', 'Watch', 'This gold-tone stainless steel watch will work with most of your outfits.', '/static/img/products/watch.jpg', 'USD', 109, 990000000, 'accessories', 100);
+
+    -- 4. Loafers
+    INSERT INTO products (id, name, description, picture, price_usd_currency_code, price_usd_units, price_usd_nanos, categories, stock)
+    VALUES ('L9ECAV7KIM', 'Loafers', 'A neat addition to your summer wardrobe.', '/static/img/products/loafers.jpg', 'USD', 89, 990000000, 'footwear', 100);
+
+    -- 5. Hairdryer
+    INSERT INTO products (id, name, description, picture, price_usd_currency_code, price_usd_units, price_usd_nanos, categories, stock)
+    VALUES ('2ZYFJ3GM2N', 'Hairdryer', 'This lightweight hairdryer has 3 heat and speed settings. It\'s perfect for travel.', '/static/img/products/hairdryer.jpg', 'USD', 24, 990000000, 'hair,beauty', 100);
+
+    -- 6. Candle Holder
+    INSERT INTO products (id, name, description, picture, price_usd_currency_code, price_usd_units, price_usd_nanos, categories, stock)
+    VALUES ('0PUK6V6EV0', 'Candle Holder', 'This small but intricate candle holder is an excellent gift.', '/static/img/products/candle-holder.jpg', 'USD', 18, 990000000, 'decor,home', 100);
+
+    -- 7. Salt & Pepper Shakers
+    INSERT INTO products (id, name, description, picture, price_usd_currency_code, price_usd_units, price_usd_nanos, categories, stock)
+    VALUES ('LS4PSXUNUM', 'Salt & Pepper Shakers', 'Add some flavor to your kitchen.', '/static/img/products/salt-and-pepper-shakers.jpg', 'USD', 18, 490000000, 'kitchen', 100);
+
+    -- 8. Bamboo Glass Jar
+    INSERT INTO products (id, name, description, picture, price_usd_currency_code, price_usd_units, price_usd_nanos, categories, stock)
+    VALUES ('9SIQT8TOJO', 'Bamboo Glass Jar', 'This bamboo glass jar can hold 57 oz (1.7 l) and is perfect for any kitchen.', '/static/img/products/bamboo-glass-jar.jpg', 'USD', 5, 490000000, 'kitchen', 100);
+
+    -- 9. Mug
+    INSERT INTO products (id, name, description, picture, price_usd_currency_code, price_usd_units, price_usd_nanos, categories, stock)
+    VALUES ('6E92ZMYYFZ', 'Mug', 'A simple mug with a mustard interior.', '/static/img/products/mug.jpg', 'USD', 8, 990000000, 'kitchen', 100);
+
+    -- =============================================
+    -- OrderService 数据库和表
+    -- =============================================
+    CREATE DATABASE IF NOT EXISTS order_db;
+    USE order_db;
+
+    CREATE TABLE IF NOT EXISTS orders (
+        order_id VARCHAR(64) PRIMARY KEY,
+        user_id VARCHAR(64),
+        shipping_address TEXT,
+        total_price_currency_code CHAR(3),
+        total_price_units BIGINT,
+        total_price_nanos INT,
+        status INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_user_id (user_id),
+        INDEX idx_status_created_at (status, created_at)
+    );
+
+    CREATE TABLE IF NOT EXISTS order_items (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        order_id VARCHAR(64),
+        product_id VARCHAR(64),
+        quantity INT,
+        cost_currency_code CHAR(3),
+        cost_units BIGINT,
+        cost_nanos INT,
+        INDEX idx_order_id (order_id),
+        FOREIGN KEY (order_id) REFERENCES orders(order_id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS shipments (
+        order_id VARCHAR(64) PRIMARY KEY,
+        tracking_id VARCHAR(128) NOT NULL,
+        status TINYINT NOT NULL DEFAULT 0,
+        error_msg TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS failed_orders (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        order_id VARCHAR(64),
+        original_json TEXT,
+        error_reason VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_order_id (order_id)
+    );
+
+    -- =============================================
+    -- UserService 数据库和表
+    -- =============================================
+    CREATE DATABASE IF NOT EXISTS user_db;
+    USE user_db;
+
+    CREATE TABLE IF NOT EXISTS users (
+        user_id VARCHAR(64) PRIMARY KEY,
+        username VARCHAR(32) UNIQUE NOT NULL,
+        password VARCHAR(128) NOT NULL,
+        INDEX idx_username (username)
+    );
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-headless-service
+  labels:
+    app: mysql
+spec:
+  ports:
+  - port: 3306
+  clusterIP: None
+  selector:
+    app: mysql
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-service
+  labels:
+    app: mysql
+spec:
+  ports:
+  - port: 3306
+  selector:
+    app: mysql
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql-statefulset
+spec:
+  serviceName: "mysql-headless-service"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: "root_password"
+        - name: MYSQL_DATABASE
+          value: "product_db"
+        ports:
+        - containerPort: 3306
+        volumeMounts:
+        - name: mysql-persistent-storage
+          mountPath: /var/lib/mysql
+        - name: mysql-init-volume
+          mountPath: /docker-entrypoint-initdb.d
+      volumes:
+      - name: mysql-init-volume
+        configMap:
+          name: mysql-init-script
+      - name: mysql-persistent-storage
+        persistentVolumeClaim:
+          claimName: mysql-pvc
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
