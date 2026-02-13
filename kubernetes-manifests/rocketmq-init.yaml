@@ -14,7 +14,7 @@ spec:
             echo "Waiting for NameServer..."
             until ./mqadmin clusterList -n rocketmq-namesrv:9876; do sleep 5; done
             echo "Creating topics..."
-            ./mqadmin updateTopic -n rocketmq-namesrv:9876 -t orders -c DefaultCluster
+            ./mqadmin updateTopic -n rocketmq-namesrv:9876 -t order_created -c DefaultCluster
             ./mqadmin updateTopic -n rocketmq-namesrv:9876 -t order_status_events -c DefaultCluster
             echo "Topics created successfully."
       restartPolicy: OnFailure
