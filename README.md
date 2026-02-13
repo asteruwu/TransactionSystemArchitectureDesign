@@ -74,12 +74,15 @@ src/
 ├── productcatalogservice/       # 商品目录服务 (库存核心)
 │   ├── server.go                # gRPC Server + 初始化
 │   ├── repository/
-│   │   ├── cached_repo.go       # Redis 缓存层 + Lua 脚本 + Stream Worker (内嵌)
+│   │   ├── cached_repo.go       # Redis 缓存层 + Lua 脚本 + Stream Worker
 │   │   └── mysql_repo.go        # MySQL 基础数据层
 │   ├── forwarder/
 │   │   └── worker.go            # Redis Stream → RocketMQ 转发器
 │   ├── model/
 │   │   └── product.go           # 商品模型
+│   └── worker/ (内嵌于 cached_repo)
+│       ├── Stream Worker         # Redis Stream → MySQL 批量刷盘
+│       └── Pending Recovery      # 超时消息补偿
 │
 ├── orderservice/                # 订单服务
 │   ├── main.go                  # 服务入口 + Worker 启动
@@ -115,8 +118,6 @@ src/
 
 ### 1. 同步下单流程
 
-用户发起下单请求后，系统通过 gRPC 协调各服务。核心库存扣减操作完全在 Redis 中通过 Lua 脚本原子执行，避免了数据库锁竞争，确保了极高的吞吐量。支付成功后立即返回响应，后续的订单落库与发货由异步链路接管。
-
 ![同步下单流程](images/同步下单流程.svg)
 
 ### 2. 异步 Worker 与补偿机制
@@ -125,25 +126,17 @@ src/
 
 #### 2.1 库存同步链路 (ProductCatalogService)
 
-采用 **Write-Behind（写后）** 策略。`StockWorker` 周期性从 Redis Stream 批量拉取扣减记录（Batch Size: 200），在内存中聚合相同商品的扣减量，最终合并为一条 SQL 更新数据库。这种机制将数据库的写入压力降低了几个数量级。
-
 ![库存同步链路](images/库存同步链路.svg)
 
 #### 2.2 订单创建链路
-
-为了解耦库存与订单服务，`OrderForwarder` 作为中继组件，负责将订单数据从 Redis Stream 可靠地投递到 RocketMQ。下游的 `OrderConsumer` 削峰填谷，批量将订单数据写入 MySQL，保障了流量高峰下的系统稳定性。
 
 ![订单创建链路](images/订单创建链路.svg)
 
 #### 2.3 发货与状态更新链路
 
-基于 **事件驱动架构**。订单支付成功后发出 `PAID` 事件，触发消费者并发调用物流服务。若发货失败，系统会自动重试；若长时间未发货，`ShippingRecoverWorker` 会作为最终兜底机制介入，确保每一笔已付订单都能成功履约。
-
 ![发货与状态更新链路](images/发货与状态更新链路.svg)
 
 #### 2.4 死信队列处理
-
-作为系统的最后一道防线。当消息经过多次重试仍无法消费时（如代码 Bug 或脏数据），会被路由至死信队列（DLQ）并持久化到数据库。这既防止了毒消息阻塞正常消费链路，也为后续的人工排查提供了现场数据。
 
 ![死信队列处理](images/死信队列处理.svg)
 
@@ -232,24 +225,15 @@ src/
 
 **ProductCatalogService** 集成了完整的自定义业务指标，其余服务目前仅有 gRPC 框架级指标。
 
-#### 核心业务指标 (Business Metrics)
+#### ProductCatalogService 自定义指标
 
-| 指标 | 类型 | 说明 | 来源 |
-|------|------|------|------|
-| `app_order_placed_total` | Counter | **下单总数** (Checkout Service 入口) | `checkoutservice` |
-| `app_stock_charge_success_total` | Counter | **库存扣减成功数** (Redis 层面) | `productcatalogservice` |
-| `app_shipping_success_total` | Counter | **发货成功数** (分 normal/retry 来源) | `orderservice` |
-| `app_forwarder_lag_ms` | Gauge | **转发延迟** (Redis Stream → RocketMQ) | `productcatalogservice` |
-| `repo_flush_success_total` | Gauge | **库存落库** (Async Worker 批量刷盘成功数) | `productcatalogservice` |
-
-#### 技术亮点 (Traces)
-
-1. **跨进程 Context 传播**:
-   - `ProductCatalogService` 手动将 Trace Context 注入 Redis Stream Payload。
-   - `OrderForwarder` 提取 Context 并透传至 RocketMQ UserProperties。
-
-2. **批量链路关联 (Span Links)**:
-   - `OrderConsumer` 在批量消费时，使用 `Span Links` 关联上游多个 Producer Span，完美解决 Batch 场景下的 Trace 断裂问题。
+| 指标名 | 类型 | 说明 |
+|--------|------|------|
+| `repo_flush_success_total` | Gauge | Stock Stream 落库成功次数 |
+| `repo_flush_fail_total` | Gauge | Stock Stream 落库失败次数 |
+| `repo_ack_fail_total` | Gauge | Stream ACK 失败次数 |
+| `repo_recover_success_total` | Gauge | Pending 消息恢复成功次数 |
+| `repo_recover_fail_total` | Gauge | Pending 消息恢复失败次数 |
 
 #### 指标数据流
 
