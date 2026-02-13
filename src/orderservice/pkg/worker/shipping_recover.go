@@ -3,12 +3,16 @@ package worker
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/genproto"
 	"github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/pkg/model"
 	"github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/pkg/repository"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 type ShippingRecoverWorker struct {
@@ -16,16 +20,49 @@ type ShippingRecoverWorker struct {
 	shippingClient pb.ShippingServiceClient
 	log            *logrus.Entry
 	interval       time.Duration
+
+	shippingSuccessTotal uint64
+	recoverySuccessTotal uint64
+	recoveryFailTotal    uint64
+	recoverySkipTotal    uint64
 }
 
 // 构造 shipping recover worker
 func NewShippingRecoverWorker(repo repository.OrderRepo, shippingClient pb.ShippingServiceClient, log *logrus.Logger) *ShippingRecoverWorker {
-	return &ShippingRecoverWorker{
+	w := &ShippingRecoverWorker{
 		repo:           repo,
 		shippingClient: shippingClient,
 		log:            log.WithField("worker", "ShippingRecoverWorker"),
 		interval:       10 * time.Second,
 	}
+	w.registerMetrics()
+
+	return w
+}
+
+func (w *ShippingRecoverWorker) registerMetrics() {
+	meter := otel.GetMeterProvider().Meter("orderservice.shipping_recover")
+	// 1. 发货成功次数 (Recovery Worker 侧)
+	meter.Int64ObservableGauge("app_shipping_success_total",
+		metric.WithInt64Callback(func(_ context.Context, obs metric.Int64Observer) error {
+			obs.Observe(int64(atomic.LoadUint64(&w.shippingSuccessTotal)),
+				metric.WithAttributes(attribute.String("source", "recovery_worker")))
+			return nil
+		}),
+	)
+
+	// 2. 补单触发次数 (Resiliency)
+	meter.Int64ObservableGauge("app_shipping_recovery_triggered_total",
+		metric.WithInt64Callback(func(_ context.Context, obs metric.Int64Observer) error {
+			obs.Observe(int64(atomic.LoadUint64(&w.recoverySuccessTotal)),
+				metric.WithAttributes(attribute.String("result", "success")))
+			obs.Observe(int64(atomic.LoadUint64(&w.recoveryFailTotal)),
+				metric.WithAttributes(attribute.String("result", "failed")))
+			obs.Observe(int64(atomic.LoadUint64(&w.recoverySkipTotal)),
+				metric.WithAttributes(attribute.String("result", "already_shipped")))
+			return nil
+		}),
+	)
 }
 
 // 启动 shipping recover worker
@@ -115,6 +152,8 @@ func (w *ShippingRecoverWorker) recoverOrderAndCollect(ctx context.Context, orde
 	trackResp, err := w.shippingClient.GetTrackingId(reqCtx, &pb.GetTrackingIdRequest{OrderId: order.OrderID})
 	if err == nil && trackResp.TrackingId != "" {
 		log.Infof("Found existing tracking ID %s. Repairing local state.", trackResp.TrackingId)
+		atomic.AddUint64(&w.recoverySkipTotal, 1)
+		atomic.AddUint64(&w.shippingSuccessTotal, 1)
 		return &model.Shipment{
 			OrderID:    order.OrderID,
 			TrackingID: trackResp.TrackingId,
@@ -147,6 +186,7 @@ func (w *ShippingRecoverWorker) recoverOrderAndCollect(ctx context.Context, orde
 
 	if shipErr != nil {
 		log.Errorf("Failed to ship order after retries: %v", shipErr)
+		atomic.AddUint64(&w.recoveryFailTotal, 1)
 		return &model.Shipment{
 			OrderID:    order.OrderID,
 			TrackingID: "",
@@ -155,7 +195,8 @@ func (w *ShippingRecoverWorker) recoverOrderAndCollect(ctx context.Context, orde
 		}
 	}
 
-	// Success
+	atomic.AddUint64(&w.recoverySuccessTotal, 1)
+	atomic.AddUint64(&w.shippingSuccessTotal, 1)
 	return &model.Shipment{
 		OrderID:    order.OrderID,
 		TrackingID: shipResp.TrackingId,

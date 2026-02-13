@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	rocketmq "github.com/apache/rocketmq-client-go/v2"
@@ -13,6 +16,9 @@ import (
 	redis "github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 	"github.com/sony/gobreaker"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 const (
@@ -23,11 +29,12 @@ const (
 
 // OrderForwarder 从本地 Redis Stream 读取订单消息，转发至 RocketMQ
 type OrderForwarder struct {
-	rdb      *redis.Client
-	producer rocketmq.Producer
-	log      *logrus.Logger
-	cb       *gobreaker.CircuitBreaker
-	consumer string
+	rdb          *redis.Client
+	producer     rocketmq.Producer
+	log          *logrus.Logger
+	cb           *gobreaker.CircuitBreaker
+	consumer     string
+	currentLagMs int64
 }
 
 // NewOrderForwarder 构造 Forwarder Worker
@@ -51,13 +58,29 @@ func NewOrderForwarder(rdb *redis.Client, producer rocketmq.Producer, log *logru
 		},
 	}
 
-	return &OrderForwarder{
+	f := &OrderForwarder{
 		rdb:      rdb,
 		producer: producer,
 		log:      log,
 		cb:       gobreaker.NewCircuitBreaker(st),
 		consumer: fmt.Sprintf("forwarder-%s", hostname),
 	}
+	f.registerMetrics()
+
+	return f
+}
+
+func (f *OrderForwarder) registerMetrics() {
+	meter := otel.GetMeterProvider().Meter("productcatalogservice.forwarder")
+	// 1. Forwarder 转发延迟 (Redis Stream -> RocketMQ)
+	meter.Int64ObservableGauge("app_forwarder_lag_ms",
+		metric.WithDescription("Forwarder lag from Redis Stream to RocketMQ"),
+		metric.WithInt64Callback(func(_ context.Context, obs metric.Int64Observer) error {
+			obs.Observe(atomic.LoadInt64(&f.currentLagMs),
+				metric.WithAttributes(attribute.String("group", forwarderGroup)))
+			return nil
+		}),
+	)
 }
 
 // Start 启动 Forwarder Worker
@@ -181,8 +204,24 @@ func (f *OrderForwarder) processMessages(ctx context.Context, messages []redis.X
 		pMsg.WithKeys([]string{orderID})
 		pMsg.WithTag("order_created")
 
+		// 提取并注入 Trace Context
+		if traceData, ok := orderData["trace_ctx"].(map[string]interface{}); ok {
+			for k, v := range traceData {
+				if vStr, ok := v.(string); ok {
+					pMsg.WithProperty(k, vStr)
+				}
+			}
+		}
+
 		batchMsgs = append(batchMsgs, pMsg)
 		validMsgIDs = append(validMsgIDs, msg.ID)
+
+		if parts := strings.SplitN(msg.ID, "-", 2); len(parts) == 2 {
+			if tsMs, err := strconv.ParseInt(parts[0], 10, 64); err == nil {
+				lag := time.Now().UnixMilli() - tsMs
+				atomic.StoreInt64(&f.currentLagMs, lag)
+			}
+		}
 	}
 
 	if len(batchMsgs) == 0 {

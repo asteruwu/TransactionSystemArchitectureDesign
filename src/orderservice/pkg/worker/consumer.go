@@ -6,9 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/pkg/model"
 	"github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/pkg/repository"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	pb "github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/genproto"
 	rocketmq "github.com/apache/rocketmq-client-go/v2"
@@ -25,6 +32,10 @@ type ConsumerWorker struct {
 	producer       rocketmq.Producer
 	shippingClient pb.ShippingServiceClient
 	groupID        string
+
+	shippingSuccessTotal uint64
+	e2eLatency           metric.Int64Histogram
+	consumerLag          metric.Int64Histogram
 }
 
 // 构造 consumer
@@ -41,14 +52,38 @@ func NewConsumerWorker(nameServers []string, groupID string, producer rocketmq.P
 		return nil, fmt.Errorf("failed to create rocketmq consumer: %w", err)
 	}
 
-	return &ConsumerWorker{
+	w := &ConsumerWorker{
 		repo:           repo,
 		logger:         log,
 		client:         c,
 		producer:       producer,
 		shippingClient: shippingClient,
 		groupID:        groupID,
-	}, nil
+	}
+	w.registerMetrics()
+
+	return w, nil
+}
+
+func (w *ConsumerWorker) registerMetrics() {
+	meter := otel.GetMeterProvider().Meter("orderservice.consumer")
+	// 1. 订单端到端延迟 (Create -> DB Insert)
+	w.e2eLatency, _ = meter.Int64Histogram("app_order_e2e_latency_ms",
+		metric.WithDescription("Order end-to-end latency from creation to DB insert"))
+
+	// 2. RocketMQ 消费延迟
+	w.consumerLag, _ = meter.Int64Histogram("rocketmq_consumer_lag_ms",
+		metric.WithDescription("RocketMQ consumer lag"))
+
+	// 3. 发货成功次数 (Consumer 侧)
+	meter.Int64ObservableGauge("app_shipping_success_total",
+		metric.WithDescription("Shipping success count"),
+		metric.WithInt64Callback(func(_ context.Context, obs metric.Int64Observer) error {
+			obs.Observe(int64(atomic.LoadUint64(&w.shippingSuccessTotal)),
+				metric.WithAttributes(attribute.String("source", "mq_consumer")))
+			return nil
+		}),
+	)
 }
 
 // 启动 mq 下游 consumer
@@ -81,8 +116,16 @@ func (w *ConsumerWorker) handleMessage(ctx context.Context, msgs ...*primitive.M
 	if len(msgs) == 0 {
 		return consumer.ConsumeSuccess, nil
 	}
-	topic := msgs[0].Topic
 
+	for _, msg := range msgs {
+		lag := time.Now().UnixMilli() - msg.StoreTimestamp
+		w.consumerLag.Record(ctx, lag,
+			metric.WithAttributes(
+				attribute.String("group", w.groupID),
+				attribute.String("topic", msg.Topic)))
+	}
+
+	topic := msgs[0].Topic
 	if topic == "order_status_events" {
 		return w.handleOrderStatusUpdate(ctx, msgs)
 	}
@@ -99,6 +142,7 @@ func (w *ConsumerWorker) handleOrderStatusUpdate(ctx context.Context, msgs []*pr
 	var paidEvents []parsedEvent
 	statusMap := make(map[string]int32)
 	validMsgs := make([]*primitive.MessageExt, 0, len(msgs))
+	traceLinks := make([]trace.Link, 0, len(msgs))
 
 	// 1. 解析并聚合有效消息
 	for _, msg := range msgs {
@@ -108,6 +152,14 @@ func (w *ConsumerWorker) handleOrderStatusUpdate(ctx context.Context, msgs []*pr
 			w.sendToDLQ(ctx, msg, fmt.Sprintf("json_unmarshal_error: %v", err))
 			continue
 		}
+
+		// 1.1 提取 Trace Context 并创建 Span
+		carrier := propagation.MapCarrier{}
+		for k, v := range msg.GetProperties() {
+			carrier[k] = v
+		}
+		upstreamCtx := otel.GetTextMapPropagator().Extract(ctx, carrier)
+		traceLinks = append(traceLinks, trace.Link{SpanContext: trace.SpanContextFromContext(upstreamCtx)})
 
 		statusInt := int32(0)
 		switch event.Status {
@@ -121,6 +173,7 @@ func (w *ConsumerWorker) handleOrderStatusUpdate(ctx context.Context, msgs []*pr
 			continue
 		}
 
+		// 1.2 聚合状态更新
 		statusMap[event.OrderID] = statusInt
 		validMsgs = append(validMsgs, msg)
 	}
@@ -129,7 +182,14 @@ func (w *ConsumerWorker) handleOrderStatusUpdate(ctx context.Context, msgs []*pr
 		return consumer.ConsumeSuccess, nil
 	}
 
-	// 2. 批量更新状态
+	tracer := otel.Tracer("orderservice-worker")
+	ctx, batchSpan := tracer.Start(ctx, "batch_status_update",
+		trace.WithLinks(traceLinks...),
+		trace.WithSpanKind(trace.SpanKindConsumer),
+	)
+	defer batchSpan.End()
+
+	// 2. 默认：批量更新状态
 	err := w.repo.UpdateOrderStatusBatch(ctx, statusMap)
 	if err != nil {
 		w.logger.Warnf("[OrderStatus] Batch update failed (%v), falling back to sequential update", err)
@@ -230,6 +290,7 @@ func (w *ConsumerWorker) shipOrderAndCollect(ctx context.Context, order *model.O
 	}
 
 	w.logger.Infof("[Shipping] Order %s shipped successfully, tracking: %s", order.OrderID, shipResp.TrackingId)
+	atomic.AddUint64(&w.shippingSuccessTotal, 1)
 	return &model.Shipment{
 		OrderID:    order.OrderID,
 		TrackingID: shipResp.TrackingId,
@@ -283,6 +344,7 @@ func (w *ConsumerWorker) convertToCartItems(items []model.OrderItem) []*pb.CartI
 func (w *ConsumerWorker) handleOrderCreate(ctx context.Context, msgs []*primitive.MessageExt) (consumer.ConsumeResult, error) {
 	var validOrders []*model.Order
 	var validMsgs []*primitive.MessageExt
+	traceLinks := make([]trace.Link, 0, len(msgs))
 
 	// 1. 解析并聚合有效消息
 	for _, msg := range msgs {
@@ -292,6 +354,14 @@ func (w *ConsumerWorker) handleOrderCreate(ctx context.Context, msgs []*primitiv
 			w.sendToDLQ(ctx, msg, fmt.Sprintf("json_unmarshal_error: %v", err))
 			continue
 		}
+
+		// 提取 Trace Context
+		carrier := propagation.MapCarrier{}
+		for k, v := range msg.GetProperties() {
+			carrier[k] = v
+		}
+		upstreamCtx := otel.GetTextMapPropagator().Extract(ctx, carrier)
+		traceLinks = append(traceLinks, trace.Link{SpanContext: trace.SpanContextFromContext(upstreamCtx)})
 
 		order := &model.Order{
 			OrderID:    rMsg.OrderID,
@@ -309,13 +379,25 @@ func (w *ConsumerWorker) handleOrderCreate(ctx context.Context, msgs []*primitiv
 		return consumer.ConsumeSuccess, nil
 	}
 
-	// 2. 默认：批量插入订单记录
+	tracer := otel.Tracer("orderservice-worker")
+	ctx, batchSpan := tracer.Start(ctx, "batch_insert_orders",
+		trace.WithLinks(traceLinks...),
+		trace.WithSpanKind(trace.SpanKindConsumer),
+	)
+	defer batchSpan.End()
+
+	// 2. 默认：批量插入
 	err := w.repo.InsertOrdersBatch(ctx, validOrders)
 	if err == nil {
+		for _, msg := range validMsgs {
+			lag := time.Now().UnixMilli() - msg.BornTimestamp
+			w.e2eLatency.Record(ctx, lag, metric.WithAttributes(attribute.String("flow", "create_order")))
+		}
 		return consumer.ConsumeSuccess, nil
 	}
 
-	// 3. 降级：批量插入失败
+	// 3. 降级：逐条插入
+	batchSpan.RecordError(err)
 	w.logger.Warnf("Batch insert failed (%v), falling back to sequential insert for %d messages", err, len(validOrders))
 	return w.fallbackSequentialInsert(ctx, validMsgs, validOrders)
 }

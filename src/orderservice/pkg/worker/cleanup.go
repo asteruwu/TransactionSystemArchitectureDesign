@@ -3,12 +3,16 @@ package worker
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/genproto"
 	"github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/pkg/model"
 	"github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/pkg/repository"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -18,6 +22,11 @@ type OrderCleanupWorker struct {
 	logger        *logrus.Logger
 	paymentClient pb.PaymentServiceClient
 	catalogClient pb.ProductCatalogServiceClient
+
+	expiredFoundTotal    uint64
+	rollbackSuccessTotal uint64
+	rollbackFailTotal    uint64
+	fixPaidStatusTotal   uint64
 }
 
 func NewOrderCleanupWorker(
@@ -26,12 +35,33 @@ func NewOrderCleanupWorker(
 	catalogClient pb.ProductCatalogServiceClient,
 	log *logrus.Logger,
 ) *OrderCleanupWorker {
-	return &OrderCleanupWorker{
+	w := &OrderCleanupWorker{
 		repo:          repo,
 		logger:        log,
 		paymentClient: paymentClient,
 		catalogClient: catalogClient,
 	}
+	w.registerMetrics()
+
+	return w
+}
+
+func (w *OrderCleanupWorker) registerMetrics() {
+	meter := otel.GetMeterProvider().Meter("orderservice.cleanup")
+	// 1. 清理任务执行统计
+	meter.Int64ObservableGauge("app_cleanup_job_total",
+		metric.WithInt64Callback(func(_ context.Context, obs metric.Int64Observer) error {
+			obs.Observe(int64(atomic.LoadUint64(&w.expiredFoundTotal)),
+				metric.WithAttributes(attribute.String("action", "scan_expired")))
+			obs.Observe(int64(atomic.LoadUint64(&w.rollbackSuccessTotal)),
+				metric.WithAttributes(attribute.String("action", "rollback_stock"), attribute.String("result", "success")))
+			obs.Observe(int64(atomic.LoadUint64(&w.rollbackFailTotal)),
+				metric.WithAttributes(attribute.String("action", "rollback_stock"), attribute.String("result", "failed")))
+			obs.Observe(int64(atomic.LoadUint64(&w.fixPaidStatusTotal)),
+				metric.WithAttributes(attribute.String("action", "fix_paid_status")))
+			return nil
+		}),
+	)
 }
 
 func (w *OrderCleanupWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
@@ -67,6 +97,7 @@ func (w *OrderCleanupWorker) processExpiredOrders(ctx context.Context) {
 	}
 
 	w.logger.Infof("[CleanupWorker] Found %d expired pending orders. Starting reconciliation...", len(orders))
+	atomic.AddUint64(&w.expiredFoundTotal, uint64(len(orders)))
 
 	// 2. 并发查询支付状态，分类
 	var mu sync.Mutex
@@ -113,6 +144,7 @@ func (w *OrderCleanupWorker) processExpiredOrders(ctx context.Context) {
 	// 3. 批量更新已支付订单状态为 PAID
 	if len(paidOrders) > 0 {
 		w.logger.Infof("[CleanupWorker] Fixing %d orders to PAID status", len(paidOrders))
+		atomic.AddUint64(&w.fixPaidStatusTotal, uint64(len(paidOrders)))
 		statusMap := make(map[string]int32)
 		for _, oid := range paidOrders {
 			statusMap[oid] = 1 // PAID
@@ -139,8 +171,10 @@ func (w *OrderCleanupWorker) processExpiredOrders(ctx context.Context) {
 		_, err := w.catalogClient.RestockProduct(ctx, restockReq)
 		if err != nil {
 			w.logger.Errorf("[CleanupWorker] Restock failed for %s: %v. Will retry next tick.", order.OrderID, err)
+			atomic.AddUint64(&w.rollbackFailTotal, 1)
 			continue
 		}
+		atomic.AddUint64(&w.rollbackSuccessTotal, 1)
 		cancelledOrders = append(cancelledOrders, order.OrderID)
 	}
 

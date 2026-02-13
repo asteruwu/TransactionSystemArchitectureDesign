@@ -17,6 +17,8 @@ import (
 	"github.com/sony/gobreaker"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/singleflight"
 	"gorm.io/gorm"
 )
@@ -48,6 +50,8 @@ type cachedRepo struct {
 	recoverSkipTotal    uint64
 
 	ACKFailTotal uint64
+
+	stockChargeSuccessTotal uint64
 }
 
 type StockDedupLog struct {
@@ -245,6 +249,18 @@ func (c *cachedRepo) registerMetrics() {
 	if err != nil {
 		c.log.Warnf("failed to register metrics: %v", err)
 	}
+
+	_, err = c.meter.Int64ObservableGauge(
+		"app_stock_charge_success_total",
+		metric.WithUnit("{ops}"),
+		metric.WithInt64Callback(func(ctx context.Context, obs metric.Int64Observer) error {
+			obs.Observe(int64(atomic.LoadUint64(&c.stockChargeSuccessTotal)))
+			return nil
+		}),
+	)
+	if err != nil {
+		c.log.Warnf("failed to register stock charge metric: %v", err)
+	}
 }
 
 func (c *cachedRepo) GetProduct(ctx context.Context, id string) (*model.Product, error) {
@@ -355,9 +371,14 @@ func (c *cachedRepo) ChargeProduct(ctx context.Context, req *pb.ChargeProductReq
 	keys = append(keys, streamKey, streamKeyOrder)
 
 	// 构造 Stock Payload JSON(含order id)
+	// 注入 Trace Context
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+
 	stockPayloadObj := map[string]interface{}{
-		"oid":   req.OrderId,
-		"items": stockItems,
+		"oid":       req.OrderId,
+		"items":     stockItems,
+		"trace_ctx": carrier,
 	}
 	stockPayloadBytes, _ := json.Marshal(stockPayloadObj)
 	args = append(args, string(stockPayloadBytes))
@@ -372,6 +393,7 @@ func (c *cachedRepo) ChargeProduct(ctx context.Context, req *pb.ChargeProductReq
 		"email":       "",
 		"status":      0,
 		"created_at":  time.Now().Unix(),
+		"trace_ctx":   carrier,
 	}
 	orderPayloadBytes, _ := json.Marshal(orderMsg)
 	args = append(args, string(orderPayloadBytes))
@@ -408,7 +430,7 @@ func (c *cachedRepo) ChargeProduct(ctx context.Context, req *pb.ChargeProductReq
 		}
 
 		if code == 1 || code == 2 {
-			// code 1 = 新扣减成功, code 2 = 幂等命中(已处理过)
+			atomic.AddUint64(&c.stockChargeSuccessTotal, 1)
 			return true, "Success"
 		}
 		if code == 0 {
@@ -589,10 +611,11 @@ func (c *cachedRepo) flushBufferToMySQL(ctx context.Context, messages []redis.XM
 		existedMap[id] = true
 	}
 
-	// 过滤重复消息，并聚合
+	// 解析并聚合有效消息
 	validBuffer := make(map[string]int32)
 	validNewMsgIDs := make([]string, 0, len(messages))
 	newLogEntries := make([]StockDedupLog, 0, len(messages))
+	traceLinks := make([]trace.Link, 0, len(messages))
 
 	for _, msg := range messages {
 		if existedMap[msg.ID] {
@@ -612,8 +635,9 @@ func (c *cachedRepo) flushBufferToMySQL(ctx context.Context, messages []redis.XM
 		}
 
 		var payloadObj struct {
-			Oid   string      `json:"oid"`
-			Items []stockItem `json:"items"`
+			Oid      string                 `json:"oid"`
+			Items    []stockItem            `json:"items"`
+			TraceCtx propagation.MapCarrier `json:"trace_ctx"`
 		}
 
 		if err := json.Unmarshal([]byte(payloadStr), &payloadObj); err != nil {
@@ -626,6 +650,11 @@ func (c *cachedRepo) flushBufferToMySQL(ctx context.Context, messages []redis.XM
 			validBuffer[item.Pid] += item.Amt
 		}
 
+		if len(payloadObj.TraceCtx) > 0 {
+			sc := otel.GetTextMapPropagator().Extract(ctx, payloadObj.TraceCtx)
+			traceLinks = append(traceLinks, trace.Link{SpanContext: trace.SpanContextFromContext(sc)})
+		}
+
 		// 记录新消息
 		validNewMsgIDs = append(validNewMsgIDs, msg.ID)
 		newLogEntries = append(newLogEntries, StockDedupLog{
@@ -634,7 +663,14 @@ func (c *cachedRepo) flushBufferToMySQL(ctx context.Context, messages []redis.XM
 		})
 	}
 
-	// 批量更新数据库 (CASE WHEN 一次更新)
+	tracer := otel.Tracer("productcatalogservice-repo")
+	ctx, flushSpan := tracer.Start(ctx, "stock_flush_batch",
+		trace.WithLinks(traceLinks...),
+		trace.WithSpanKind(trace.SpanKindConsumer),
+	)
+	defer flushSpan.End()
+
+	// 更新库存，记录去重
 	if len(validBuffer) > 0 {
 		// 构建 CASE WHEN 语句
 		caseStmt := "CASE id"

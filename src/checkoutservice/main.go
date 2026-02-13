@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/profiler"
@@ -36,6 +37,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
@@ -85,6 +87,8 @@ type checkoutService struct {
 
 	orderSvcAddr string
 	orderSvcConn *grpc.ClientConn
+
+	orderPlacedTotal uint64
 }
 
 func main() {
@@ -118,6 +122,8 @@ func main() {
 	}
 
 	svc := new(checkoutService)
+	svc.registerMetrics()
+
 	mustMapEnv(&svc.shippingSvcAddr, "SHIPPING_SERVICE_ADDR")
 	mustMapEnv(&svc.productCatalogSvcAddr, "PRODUCT_CATALOG_SERVICE_ADDR")
 	mustMapEnv(&svc.cartSvcAddr, "CART_SERVICE_ADDR")
@@ -337,6 +343,7 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 
 	// 返回订单结果
 	resp := &pb.PlaceOrderResponse{Order: orderResult}
+	atomic.AddUint64(&cs.orderPlacedTotal, 1)
 	return resp, nil
 }
 
@@ -451,4 +458,16 @@ func (cs *checkoutService) sendOrderConfirmation(ctx context.Context, email stri
 		Email: email,
 		Order: order})
 	return err
+}
+
+func (cs *checkoutService) registerMetrics() {
+	meter := otel.GetMeterProvider().Meter("checkoutservice")
+	// 1. 成功下单总次数
+	meter.Int64ObservableGauge("app_order_placed_total",
+		metric.WithDescription("Total number of orders placed successfully"),
+		metric.WithInt64Callback(func(_ context.Context, obs metric.Int64Observer) error {
+			obs.Observe(int64(atomic.LoadUint64(&cs.orderPlacedTotal)))
+			return nil
+		}),
+	)
 }
