@@ -171,6 +171,7 @@ func run(port string, ctx context.Context, wg *sync.WaitGroup) (string, *grpc.Se
 			propagation.TraceContext{}, propagation.Baggage{}))
 
 	srv := grpc.NewServer(
+		// 自动拦截grpc调用，实现自动埋点
 		grpc.StatsHandler(otelgrpc.NewServerHandler()))
 
 	repo, rdb := initDB(ctx, wg)
@@ -244,6 +245,7 @@ func initTracing(ctx context.Context) (*sdktrace.TracerProvider, error) {
 		return nil, fmt.Errorf("failed to create resource: %w", err)
 	}
 
+	// 创建导出器和采样器
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(0.1))),
@@ -301,6 +303,7 @@ func initDB(ctx context.Context, wg *sync.WaitGroup) (repository.ProductReposito
 	log.Info("connected to mysql")
 	baserepo := repository.NewMysqlRepo(db)
 
+	// 监控 sql 语句执行时间
 	if err := db.Use(otelgorm.NewPlugin()); err != nil {
 		log.Fatalf("failed to initialize otelgorm plugin: %v", err)
 	}

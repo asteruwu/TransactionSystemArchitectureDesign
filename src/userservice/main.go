@@ -26,6 +26,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 
+	"github.com/uptrace/opentelemetry-go-extra/otelgorm"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
@@ -99,6 +100,11 @@ func main() {
 		log.Fatalf("failed to connect to mysql: %v", err)
 	}
 	log.Info("connected to mysql")
+
+	// 监控 sql 语句执行时间
+	if err := db.Use(otelgorm.NewPlugin()); err != nil {
+		log.Fatalf("failed to initialize otelgorm plugin: %v", err)
+	}
 
 	// 自动迁移表结构
 	db.AutoMigrate(&model.User{})

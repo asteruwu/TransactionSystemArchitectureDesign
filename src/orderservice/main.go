@@ -29,6 +29,8 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 
+	"github.com/uptrace/opentelemetry-go-extra/otelgorm"
+
 	// Tracing
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
@@ -242,12 +244,19 @@ func initDB() repository.OrderRepo {
 	if err != nil {
 		log.Fatalf("failed to connect to mysql: %v", err)
 	}
+
+	// 监控 sql 语句执行时间
+	if err := db.Use(otelgorm.NewPlugin()); err != nil {
+		log.Fatalf("failed to initialize otelgorm plugin: %v", err)
+	}
+
 	// Migrate both Order tables and FailedOrder table, and Shipment (New)
 	db.AutoMigrate(&model.Order{}, &model.OrderItem{}, &model.FailedOrder{}, &model.Shipment{})
 	repo := repository.NewOrderRepo(db)
 	log.Info("connected to mysql")
 
 	return repo
+
 }
 
 func initTracing(ctx context.Context) (*sdktrace.TracerProvider, error) {
