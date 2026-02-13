@@ -17,9 +17,11 @@ data:
 
     exporters:
       prometheus:
+        # 等待Prometheus拉取
         endpoint: "0.0.0.0:8889"
         namespace: "default"
       otlp:
+        # 转发到jaeger
         endpoint: "jaeger:4317"
         tls:
           insecure: true
@@ -95,6 +97,7 @@ data:
   prometheus.yml: |
     global:
       scrape_interval: 10s
+    # 配置Prometheus任务：从otel-collector抓取指标
     scrape_configs:
       - job_name: 'otel-collector'
         static_configs:

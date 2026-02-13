@@ -156,6 +156,17 @@ spec:
     app: mysql
 
 ---
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+type: Opaque
+data:
+  # root_password (base64 encoded)
+  ROOT_PASSWORD: cm9vdF9wYXNzd29yZA==
+
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -176,7 +187,10 @@ spec:
         image: mysql:8.0
         env:
         - name: MYSQL_ROOT_PASSWORD
-          value: "root_password"
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: ROOT_PASSWORD
         - name: MYSQL_DATABASE
           value: "product_db"
         ports:
