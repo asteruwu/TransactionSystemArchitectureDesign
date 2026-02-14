@@ -235,10 +235,13 @@ func (f *OrderForwarder) processMessages(ctx context.Context, messages []redis.X
 
 	if err != nil {
 		if err == gobreaker.ErrOpenState {
-			f.log.Warnf("[Forwarder] RocketMQ send rejected by circuit breaker")
-		} else {
-			f.log.Errorf("[Forwarder] Batch send failed (will retry via recovery): %v", err)
+			// 熔断器打开：不降级，等待恢复后由 Recovery 重试
+			f.log.Warnf("[Forwarder] RocketMQ send rejected by circuit breaker, skipping fallback")
+			return
 		}
+		// 批量发送失败 -> 降级为逐条发送
+		f.log.Warnf("[Forwarder] Batch send failed (%v), falling back to sequential send", err)
+		f.sequentialSend(ctx, batchMsgs, validMsgIDs)
 		return
 	}
 
@@ -248,6 +251,35 @@ func (f *OrderForwarder) processMessages(ctx context.Context, messages []redis.X
 		f.rdb.XAck(ctx, streamKeyOrder, forwarderGroup, validMsgIDs...)
 		f.log.Debugf("[Forwarder] Forwarded %d messages to RocketMQ", len(validMsgIDs))
 	} else {
-		f.log.Warnf("[Forwarder] RocketMQ batch send status not OK: %v", res.Status)
+		// 状态非 OK -> 降级为逐条发送
+		f.log.Warnf("[Forwarder] RocketMQ batch send status not OK (%v), falling back to sequential send", res.Status)
+		f.sequentialSend(ctx, batchMsgs, validMsgIDs)
+	}
+}
+
+// sequentialSend 逐条降级发送：对每条消息单独调用 SendSync
+func (f *OrderForwarder) sequentialSend(ctx context.Context, msgs []*primitive.Message, msgIDs []string) {
+	var ackIDs []string
+
+	for i, msg := range msgs {
+		res, err := f.producer.SendSync(ctx, msg)
+		if err != nil {
+			// 逐条发送也失败：记录日志并 ACK（防止毒药消息无限阻塞队列）
+			f.log.Errorf("[Forwarder Sequential] Failed to send msg (streamID=%s): %v. ACKing to prevent blocking.", msgIDs[i], err)
+			ackIDs = append(ackIDs, msgIDs[i])
+			continue
+		}
+
+		if res.Status == primitive.SendOK {
+			ackIDs = append(ackIDs, msgIDs[i])
+		} else {
+			f.log.Warnf("[Forwarder Sequential] Send status not OK for msg (streamID=%s): %v. ACKing to prevent blocking.", msgIDs[i], res.Status)
+			ackIDs = append(ackIDs, msgIDs[i])
+		}
+	}
+
+	if len(ackIDs) > 0 {
+		f.rdb.XAck(ctx, streamKeyOrder, forwarderGroup, ackIDs...)
+		f.log.Infof("[Forwarder Sequential] Processed %d/%d messages via sequential fallback", len(ackIDs), len(msgs))
 	}
 }
