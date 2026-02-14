@@ -2,9 +2,12 @@ package repository
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
+	"net"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -21,6 +24,8 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/singleflight"
 	"gorm.io/gorm"
+
+	mysqldriver "github.com/go-sql-driver/mysql"
 )
 
 const (
@@ -577,44 +582,99 @@ func (c *cachedRepo) startStreamWorker(ctx context.Context, wg *sync.WaitGroup) 
 	}
 }
 
+// parsedStockMsg 用于存储解析后的单条库存消息
+type parsedStockMsg struct {
+	msgID string
+	oid   string
+	items []stockItem
+}
+
+type stockItem struct {
+	Pid string `json:"pid"`
+	Amt int32  `json:"amt"`
+}
+
 func (c *cachedRepo) flushBufferToMySQL(ctx context.Context, messages []redis.XMessage) {
 	atomic.StoreInt64(&c.lastFlushUnixNano, time.Now().UnixNano())
 
-	// 提取消息ID列表
+	// 1. 提取消息ID列表（用于最终的 ACK）
 	msgIDList := make([]string, 0, len(messages))
 	for _, msg := range messages {
 		msgIDList = append(msgIDList, msg.ID)
 	}
 
-	// 开启事务
-	tx := c.db.Begin()
-	if tx.Error != nil {
-		c.log.Errorf("[Flush] Failed to begin transaction: %v", tx.Error)
-		return
+	// 2. 解析所有消息（解析阶段独立于事务，可复用）
+	parsed, traceLinks := c.parseStockMessages(ctx, messages)
+
+	// 3. 创建 Trace Span
+	tracer := otel.Tracer("productcatalogservice-repo")
+	ctx, flushSpan := tracer.Start(ctx, "stock_flush_batch",
+		trace.WithLinks(traceLinks...),
+		trace.WithSpanKind(trace.SpanKindConsumer),
+	)
+	defer flushSpan.End()
+
+	// 4. 尝试批量事务写入
+	var retryMsgIDs []string // 临时失败的消息 ID，不 ACK
+	if len(parsed) > 0 {
+		if err := c.batchFlush(ctx, parsed); err != nil {
+			// 批量失败 -> 降级为逐条事务
+			c.log.Warnf("[Flush] Batch transaction failed (%v), falling back to sequential", err)
+			flushSpan.RecordError(err)
+			atomic.AddUint64(&c.flushFailTotal, 1)
+			retryMsgIDs = c.sequentialFlush(ctx, parsed)
+		} else {
+			atomic.AddUint64(&c.flushSuccessTotal, 1)
+		}
 	}
 
-	defer tx.Rollback()
+	// 5. 确认消息已处理（排除临时失败的消息，留给 Recover 重试）
+	ackIDs := msgIDList
+	if len(retryMsgIDs) > 0 {
+		retrySet := make(map[string]bool, len(retryMsgIDs))
+		for _, id := range retryMsgIDs {
+			retrySet[id] = true
+		}
+		ackIDs = make([]string, 0, len(msgIDList))
+		for _, id := range msgIDList {
+			if !retrySet[id] {
+				ackIDs = append(ackIDs, id)
+			}
+		}
+		c.log.Warnf("[Flush] %d messages skipped ACK due to transient errors (will retry via recovery)", len(retryMsgIDs))
+	}
 
-	// 检查重复消息
+	if len(ackIDs) > 0 {
+		err := c.rdb.XAck(ctx, streamKey, streamGroup, ackIDs...).Err()
+		if err != nil {
+			c.log.Errorf("[Stream Worker] Failed to ack messages: %v", err)
+			atomic.AddUint64(&c.ACKFailTotal, 1)
+		}
+	}
+}
+
+// parseStockMessages 解析原始 Redis Stream 消息，过滤重复和无效消息
+func (c *cachedRepo) parseStockMessages(ctx context.Context, messages []redis.XMessage) ([]parsedStockMsg, []trace.Link) {
+	// 批量查询已处理的消息 ID（幂等检查）
+	msgIDList := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		msgIDList = append(msgIDList, msg.ID)
+	}
+
 	var existedIDs []string
-	if err := tx.Table("stock_dedup_log").
+	if err := c.db.Table("stock_dedup_log").
 		Where("msg_id IN ?", msgIDList).
 		Pluck("msg_id", &existedIDs).Error; err != nil {
-
 		c.log.Errorf("[Flush] Failed to check dedup log: %v", err)
-		atomic.AddUint64(&c.flushFailTotal, 1)
-		return
+		return nil, nil
 	}
 
-	existedMap := make(map[string]bool)
+	existedMap := make(map[string]bool, len(existedIDs))
 	for _, id := range existedIDs {
 		existedMap[id] = true
 	}
 
-	// 解析并聚合有效消息
-	validBuffer := make(map[string]int32)
-	validNewMsgIDs := make([]string, 0, len(messages))
-	newLogEntries := make([]StockDedupLog, 0, len(messages))
+	parsed := make([]parsedStockMsg, 0, len(messages))
 	traceLinks := make([]trace.Link, 0, len(messages))
 
 	for _, msg := range messages {
@@ -622,16 +682,10 @@ func (c *cachedRepo) flushBufferToMySQL(ctx context.Context, messages []redis.XM
 			continue
 		}
 
-		// 解析 Stock Payload JSON
 		payloadStr, ok := msg.Values["payload"].(string)
 		if !ok {
 			c.log.Errorf("[Flush] Msg %s has no payload or invalid type", msg.ID)
 			continue
-		}
-
-		type stockItem struct {
-			Pid string `json:"pid"`
-			Amt int32  `json:"amt"`
 		}
 
 		var payloadObj struct {
@@ -645,79 +699,178 @@ func (c *cachedRepo) flushBufferToMySQL(ctx context.Context, messages []redis.XM
 			continue
 		}
 
-		// 聚合有效扣减
-		for _, item := range payloadObj.Items {
-			validBuffer[item.Pid] += item.Amt
-		}
+		parsed = append(parsed, parsedStockMsg{
+			msgID: msg.ID,
+			oid:   payloadObj.Oid,
+			items: payloadObj.Items,
+		})
 
 		if len(payloadObj.TraceCtx) > 0 {
 			sc := otel.GetTextMapPropagator().Extract(ctx, payloadObj.TraceCtx)
 			traceLinks = append(traceLinks, trace.Link{SpanContext: trace.SpanContextFromContext(sc)})
 		}
+	}
 
-		// 记录新消息
-		validNewMsgIDs = append(validNewMsgIDs, msg.ID)
+	return parsed, traceLinks
+}
+
+// batchFlush 批量事务：聚合所有消息后一次性写入 MySQL
+func (c *cachedRepo) batchFlush(ctx context.Context, parsed []parsedStockMsg) error {
+	// 聚合库存变更
+	validBuffer := make(map[string]int32)
+	newLogEntries := make([]StockDedupLog, 0, len(parsed))
+
+	for _, p := range parsed {
+		for _, item := range p.items {
+			validBuffer[item.Pid] += item.Amt
+		}
 		newLogEntries = append(newLogEntries, StockDedupLog{
-			MsgID:     msg.ID,
-			ProductID: payloadObj.Oid,
+			MsgID:     p.msgID,
+			ProductID: p.oid,
 		})
 	}
 
-	tracer := otel.Tracer("productcatalogservice-repo")
-	ctx, flushSpan := tracer.Start(ctx, "stock_flush_batch",
-		trace.WithLinks(traceLinks...),
-		trace.WithSpanKind(trace.SpanKindConsumer),
-	)
-	defer flushSpan.End()
-
-	// 更新库存，记录去重
-	if len(validBuffer) > 0 {
-		// 构建 CASE WHEN 语句
-		caseStmt := "CASE id"
-		ids := make([]interface{}, 0, len(validBuffer))
-		params := make([]interface{}, 0, len(validBuffer)*2)
-
-		for pid, amount := range validBuffer {
-			caseStmt += " WHEN ? THEN ?"
-			params = append(params, pid, amount)
-			ids = append(ids, pid)
-		}
-		caseStmt += " ELSE 0 END"
-
-		// UPDATE products SET stock = stock - CASE ... WHERE id IN (...)
-		query := fmt.Sprintf("UPDATE products SET stock = stock - (%s) WHERE id IN ?", caseStmt)
-		params = append(params, ids)
-
-		if err := tx.Exec(query, params...).Error; err != nil {
-			c.log.Errorf("[Flush] Failed to batch update stock: %v", err)
-			atomic.AddUint64(&c.flushFailTotal, 1)
-			return
-		}
-
-		if err := tx.Create(&newLogEntries).Error; err != nil {
-			c.log.Errorf("[Flush] Failed to insert dedup logs: %v", err)
-			atomic.AddUint64(&c.flushFailTotal, 1)
-			return
-		}
+	if len(validBuffer) == 0 {
+		return nil
 	}
 
-	// 提交事务
+	tx := c.db.WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return fmt.Errorf("begin transaction: %w", tx.Error)
+	}
+	defer tx.Rollback()
+
+	// 构建 CASE WHEN 语句
+	caseStmt := "CASE id"
+	ids := make([]interface{}, 0, len(validBuffer))
+	params := make([]interface{}, 0, len(validBuffer)*2)
+
+	for pid, amount := range validBuffer {
+		caseStmt += " WHEN ? THEN ?"
+		params = append(params, pid, amount)
+		ids = append(ids, pid)
+	}
+	caseStmt += " ELSE 0 END"
+
+	query := fmt.Sprintf("UPDATE products SET stock = stock - (%s) WHERE id IN ?", caseStmt)
+	params = append(params, ids)
+
+	if err := tx.Exec(query, params...).Error; err != nil {
+		return fmt.Errorf("batch update stock: %w", err)
+	}
+
+	if err := tx.Create(&newLogEntries).Error; err != nil {
+		return fmt.Errorf("batch insert dedup logs: %w", err)
+	}
+
 	if err := tx.Commit().Error; err != nil {
-		c.log.Errorf("[Flush] Failed to commit transaction: %v", err)
-		atomic.AddUint64(&c.flushFailTotal, 1)
-		return
+		return fmt.Errorf("commit: %w", err)
 	}
 
-	atomic.AddUint64(&c.flushSuccessTotal, 1)
+	return nil
+}
 
-	// 确认消息已处理
-	if len(msgIDList) > 0 {
-		err := c.rdb.XAck(ctx, streamKey, streamGroup, msgIDList...).Err()
-		if err != nil {
-			c.log.Errorf("[Stream Worker] Failed to ack messages: %v", err)
-			atomic.AddUint64(&c.ACKFailTotal, 1)
+// sequentialFlush 逐条降级：对每条消息独立开事务处理
+func (c *cachedRepo) sequentialFlush(ctx context.Context, parsed []parsedStockMsg) []string {
+	var retryMsgIDs []string // 临时故障的消息，不 ACK
+
+	for _, p := range parsed {
+		if err := c.flushSingleMsg(ctx, p); err != nil {
+			atomic.AddUint64(&c.flushFailTotal, 1)
+
+			if isTransientDBError(err) {
+				// 临时故障（死锁、超时、连接断开）：不 ACK，等待 Recovery 重试
+				c.log.Warnf("[Flush Sequential] Transient error for msg %s (order: %s): %v. Will retry via recovery.", p.msgID, p.oid, err)
+				retryMsgIDs = append(retryMsgIDs, p.msgID)
+			} else {
+				// 永久故障（数据约束冲突、语法错误）：ACK 防止阻塞
+				c.log.Errorf("[Flush Sequential] Permanent error for msg %s (order: %s): %v. ACKing to prevent queue blocking.", p.msgID, p.oid, err)
+			}
+		} else {
+			c.log.Infof("[Flush Sequential] Successfully flushed msg %s (order: %s)", p.msgID, p.oid)
+			atomic.AddUint64(&c.flushSuccessTotal, 1)
 		}
 	}
+
+	return retryMsgIDs
+}
+
+// flushSingleMsg 单条消息独立事务
+func (c *cachedRepo) flushSingleMsg(ctx context.Context, p parsedStockMsg) error {
+	tx := c.db.WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return fmt.Errorf("begin transaction: %w", tx.Error)
+	}
+	defer tx.Rollback()
+
+	// 幂等检查（防止批量已部分写入后降级时重复处理）
+	var count int64
+	if err := tx.Table("stock_dedup_log").Where("msg_id = ?", p.msgID).Count(&count).Error; err != nil {
+		return fmt.Errorf("dedup check: %w", err)
+	}
+	if count > 0 {
+		c.log.Infof("[Flush Sequential] Msg %s already processed, skipping", p.msgID)
+		return nil // 已处理过，幂等跳过
+	}
+
+	// 逐条更新库存
+	for _, item := range p.items {
+		if err := tx.Exec("UPDATE products SET stock = stock - ? WHERE id = ?", item.Amt, item.Pid).Error; err != nil {
+			return fmt.Errorf("update stock for product %s: %w", item.Pid, err)
+		}
+	}
+
+	// 写入去重记录
+	logEntry := StockDedupLog{
+		MsgID:     p.msgID,
+		ProductID: p.oid,
+	}
+	if err := tx.Create(&logEntry).Error; err != nil {
+		return fmt.Errorf("insert dedup log: %w", err)
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+
+	return nil
+}
+
+// isTransientDBError 判断 MySQL 错误是否为临时性故障（可重试）
+func isTransientDBError(err error) bool {
+	// 1. 检查 MySQL 驱动特定错误码
+	var mysqlErr *mysqldriver.MySQLError
+	if errors.As(err, &mysqlErr) {
+		switch mysqlErr.Number {
+		case 1213: // Deadlock found when trying to get lock
+			return true
+		case 1205: // Lock wait timeout exceeded
+			return true
+		case 1040: // Too many connections
+			return true
+		case 2002, 2003, 2006: // Connection refused / Can't connect / Server has gone away
+			return true
+		}
+		return false // 其他 MySQL 错误视为永久故障
+	}
+
+	// 2. 检查底层网络错误（如 TCP 连接断开）
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	// 3. 检查 Go 数据库驱动的连接错误
+	if errors.Is(err, driver.ErrBadConn) {
+		return true
+	}
+
+	// 4. 检查 context 超时/取消（graceful shutdown 场景）
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+
+	return false // 默认视为永久故障
 }
 
 // 启动 pending 消息恢复
