@@ -13,6 +13,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -111,6 +113,13 @@ func (s *OrderService) sendOrderStatusEvent(ctx context.Context, orderID, status
 	// 发送消息到mq
 	msg := primitive.NewMessage("order_status_events", data)
 	msg.WithKeys([]string{orderID})
+
+	// 注入 Trace Context 到 MQ 消息属性，确保下游 Consumer 能关联链路
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	for k, v := range carrier {
+		msg.WithProperty(k, v)
+	}
 
 	res, err := s.producer.SendSync(ctx, msg)
 	if err != nil {
@@ -211,14 +220,6 @@ func convertItemsToProto(items []model.OrderItem) []*pb.OrderItem {
 		})
 	}
 	return protoItems
-}
-
-func extractCartItemsFromProto(items []*pb.OrderItem) []*pb.CartItem {
-	var cartItems []*pb.CartItem
-	for _, item := range items {
-		cartItems = append(cartItems, item.Item)
-	}
-	return cartItems
 }
 
 // 订单过期时间（5分钟）
