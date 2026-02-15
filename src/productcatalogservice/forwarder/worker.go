@@ -3,7 +3,9 @@ package forwarder
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	rocketmq "github.com/apache/rocketmq-client-go/v2"
+	mqerrors "github.com/apache/rocketmq-client-go/v2/errors"
 	"github.com/apache/rocketmq-client-go/v2/primitive"
 	redis "github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
@@ -235,7 +238,6 @@ func (f *OrderForwarder) processMessages(ctx context.Context, messages []redis.X
 
 	if err != nil {
 		if err == gobreaker.ErrOpenState {
-			// 熔断器打开：不降级，等待恢复后由 Recovery 重试
 			f.log.Warnf("[Forwarder] RocketMQ send rejected by circuit breaker, skipping fallback")
 			return
 		}
@@ -260,26 +262,114 @@ func (f *OrderForwarder) processMessages(ctx context.Context, messages []redis.X
 // sequentialSend 逐条降级发送：对每条消息单独调用 SendSync
 func (f *OrderForwarder) sequentialSend(ctx context.Context, msgs []*primitive.Message, msgIDs []string) {
 	var ackIDs []string
+	var retryMsgIDs []string
 
 	for i, msg := range msgs {
 		res, err := f.producer.SendSync(ctx, msg)
 		if err != nil {
-			// 逐条发送也失败：记录日志并 ACK（防止毒药消息无限阻塞队列）
-			f.log.Errorf("[Forwarder Sequential] Failed to send msg (streamID=%s): %v. ACKing to prevent blocking.", msgIDs[i], err)
-			ackIDs = append(ackIDs, msgIDs[i])
+			if isTransientMQError(err) {
+				// 临时故障（超时、连接断开、Broker 不可用等）：不 ACK，等待 Recovery 重试
+				f.log.Warnf("[Forwarder Sequential] Transient error for msg (streamID=%s): %v. Will retry via recovery.", msgIDs[i], err)
+				retryMsgIDs = append(retryMsgIDs, msgIDs[i])
+			} else {
+				// 永久故障（Topic 不存在、消息体非法等）：ACK 防止阻塞
+				f.log.Errorf("[Forwarder Sequential] Permanent error for msg (streamID=%s): %v. ACKing to prevent blocking.", msgIDs[i], err)
+				ackIDs = append(ackIDs, msgIDs[i])
+			}
 			continue
 		}
 
 		if res.Status == primitive.SendOK {
 			ackIDs = append(ackIDs, msgIDs[i])
+		} else if isTransientSendStatus(res.Status) {
+			// FlushDiskTimeout / FlushSlaveTimeout / SlaveNotAvailable：属于临时故障，不 ACK
+			f.log.Warnf("[Forwarder Sequential] Transient send status for msg (streamID=%s): %v. Will retry via recovery.", msgIDs[i], res.Status)
+			retryMsgIDs = append(retryMsgIDs, msgIDs[i])
 		} else {
-			f.log.Warnf("[Forwarder Sequential] Send status not OK for msg (streamID=%s): %v. ACKing to prevent blocking.", msgIDs[i], res.Status)
+			// 未知状态：ACK 防止阻塞
+			f.log.Errorf("[Forwarder Sequential] Unknown send status for msg (streamID=%s): %v. ACKing to prevent blocking.", msgIDs[i], res.Status)
 			ackIDs = append(ackIDs, msgIDs[i])
 		}
+	}
+
+	if len(retryMsgIDs) > 0 {
+		f.log.Warnf("[Forwarder Sequential] %d messages skipped ACK due to transient errors (will retry via recovery)", len(retryMsgIDs))
 	}
 
 	if len(ackIDs) > 0 {
 		f.rdb.XAck(ctx, streamKeyOrder, forwarderGroup, ackIDs...)
 		f.log.Infof("[Forwarder Sequential] Processed %d/%d messages via sequential fallback", len(ackIDs), len(msgs))
+	}
+}
+
+// isTransientMQError 判断 RocketMQ 错误是否为临时性故障（可重试）
+func isTransientMQError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// 1. 检查 RocketMQ Client 预定义的临时性错误
+	if errors.Is(err, mqerrors.ErrRequestTimeout) {
+		return true
+	}
+	if errors.Is(err, mqerrors.ErrBrokerNotFound) {
+		return true
+	}
+	if errors.Is(err, mqerrors.ErrService) {
+		return true
+	}
+
+	// 2. 检查 RocketMQ Remoting 层网络错误
+	if primitive.IsRemotingErr(err) {
+		return true
+	}
+
+	// 3. 检查 Broker 返回的临时性响应码
+	var brokerErr primitive.MQBrokerErr
+	if errors.As(err, &brokerErr) {
+		switch brokerErr.ResponseCode {
+		case 10:
+			return true
+		case 11:
+			return true
+		case 12:
+			return true
+		case 14:
+			return true
+		}
+		return false
+	}
+
+	// 4. 检查底层网络错误（与 isTransientDBError 一致）
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	// 5. 检查 context 超时/取消（graceful shutdown 场景）
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+
+	// 6. 基于错误消息字符串的兜底匹配（应对未导出的错误类型）
+	errMsg := strings.ToLower(err.Error())
+	transientKeywords := []string{"timeout", "connection refused", "connect", "system busy", "service not available", "broken pipe", "reset by peer"}
+	for _, kw := range transientKeywords {
+		if strings.Contains(errMsg, kw) {
+			return true
+		}
+	}
+
+	return false // 默认视为永久故障
+}
+
+func isTransientSendStatus(status primitive.SendStatus) bool {
+	switch status {
+	case primitive.SendFlushDiskTimeout,
+		primitive.SendFlushSlaveTimeout,
+		primitive.SendSlaveNotAvailable:
+		return true
+	default:
+		return false
 	}
 }
