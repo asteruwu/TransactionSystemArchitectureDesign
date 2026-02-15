@@ -29,6 +29,17 @@ data:
         KEY idx_time (created_at)
     );
 
+    CREATE TABLE IF NOT EXISTS dead_messages (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        msg_id VARCHAR(64) NOT NULL,
+        original_stream VARCHAR(128) NOT NULL,
+        consumer_group VARCHAR(128) NOT NULL,
+        payload JSON,
+        error_reason TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_msg_id (msg_id)
+    );
+
     -- 插入 JSON 中的数据 (默认库存设为 100)
     -- 1. Sunglasses
     INSERT INTO products (id, name, description, picture, price_usd_currency_code, price_usd_units, price_usd_nanos, categories, stock)
