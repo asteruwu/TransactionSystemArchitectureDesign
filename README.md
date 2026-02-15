@@ -75,6 +75,8 @@ src/
 │   ├── server.go                # gRPC Server + 初始化
 │   ├── repository/
 │   │   ├── cached_repo.go       # Redis 缓存层 + Lua 脚本 + Stream Worker (内嵌)
+│   │   ├── dead_letter.go       # 死信 Producer
+│   │   └── dead_letter_consumer.go # 死信 Consumer
 │   │   └── mysql_repo.go        # MySQL 基础数据层
 │   ├── forwarder/
 │   │   └── worker.go            # Redis Stream → RocketMQ 转发器
@@ -141,9 +143,11 @@ src/
 
 ![发货与状态更新链路](images/发货与状态更新链路.svg)
 
-#### 2.4 死信队列处理
+#### 2.4 死信队列处理 (RocketMQ & Redis)
 
-作为系统的最后一道防线。当消息经过多次重试仍无法消费时（如代码 Bug 或脏数据），会被路由至死信队列（DLQ）并持久化到数据库。这既防止了毒消息阻塞正常消费链路，也为后续的人工排查提供了现场数据。
+作为系统的最后一道防线。当消息经过多次重试仍无法消费时（如代码 Bug 或脏数据），会被路由至死信队列（DLQ）并持久化到数据库。
+- **RocketMQ 侧**：OrderService 的 DLQ Consumer 负责消费死信并写入 MySQL。
+- **Redis 侧**：ProductCatalogService 的 `DeadLetterConsumer` 负责收集 Stock/Forwarder 的永久性失败消息，写入 `dead_messages` 表。
 
 ![死信队列处理](images/死信队列处理.svg)
 
@@ -181,8 +185,8 @@ src/
 | **Redis 不可用** | 熔断器 (gobreaker) 快速失败，避免雪崩 |
 | **Redis 缓存 Miss** | SingleFlight + 回源 MySQL + SetNX 回写缓存 |
 | **库存缓存未初始化** | 最多重试 3 次，每次从 MySQL 加载后重新执行 Lua 脚本 |
-| **批量写入失败** | 降级为逐条写入，逐条失败则标记重试或进入 DLQ |
-| **RocketMQ 发送失败** | 不 ACK Redis Stream 消息，由 Recovery Worker 周期性重试 |
+| **批量写入失败** | 降级为逐条写入，逐条失败则标记重试 (临时) 或进入 DLQ (永久) |
+| **RocketMQ 发送失败** | 临时故障由 Recovery Worker 重试；永久故障进入 Dead Stream |
 | **支付 RPC 失败** | Payment Client 包装熔断器 + 3s 超时；失败返回 PENDING，由 Cleanup Worker 后续对账 |
 | **发货 RPC 失败** | 返回 `ConsumeRetryLater`，MQ 自动重试；最终由 ShippingRecoverWorker 兜底 |
 | **DLQ 发送失败** | 打印 CRITICAL 日志，返回 Success 防止卡死后续消费 |
