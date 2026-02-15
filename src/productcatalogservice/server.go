@@ -206,7 +206,8 @@ func run(port string, ctx context.Context, wg *sync.WaitGroup) (string, *grpc.Se
 				log.Warnf("Failed to start RocketMQ producer: %v (Forwarder disabled)", err)
 			} else {
 				log.Info("RocketMQ producer started, initializing Forwarder...")
-				fwd := forwarder.NewOrderForwarder(rdb, mqProducer, log)
+				dlp := repository.NewDeadLetterProducer(rdb, log)
+				fwd := forwarder.NewOrderForwarder(rdb, mqProducer, log, dlp)
 				fwd.Start(ctx, wg)
 			}
 		}
@@ -365,6 +366,10 @@ func initDB(ctx context.Context, wg *sync.WaitGroup) (repository.ProductReposito
 	}
 
 	repo := repository.NewCachedRepo(baserepo, rdb, db, log, ctx, wg)
+
+	// 启动死信队列消费者（Redis Dead Stream -> MySQL）
+	dlConsumer := repository.NewDeadLetterConsumer(rdb, db, log)
+	dlConsumer.Start(ctx, wg)
 
 	return repo, rdb
 }

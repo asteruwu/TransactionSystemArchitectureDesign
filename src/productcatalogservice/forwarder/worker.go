@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/GoogleCloudPlatform/microservices-demo/src/productcatalogservice/repository"
 	rocketmq "github.com/apache/rocketmq-client-go/v2"
 	mqerrors "github.com/apache/rocketmq-client-go/v2/errors"
 	"github.com/apache/rocketmq-client-go/v2/primitive"
@@ -36,12 +37,13 @@ type OrderForwarder struct {
 	producer     rocketmq.Producer
 	log          *logrus.Logger
 	cb           *gobreaker.CircuitBreaker
+	dlp          *repository.DeadLetterProducer // 死信队列生产者
 	consumer     string
 	currentLagMs int64
 }
 
 // NewOrderForwarder 构造 Forwarder Worker
-func NewOrderForwarder(rdb *redis.Client, producer rocketmq.Producer, log *logrus.Logger) *OrderForwarder {
+func NewOrderForwarder(rdb *redis.Client, producer rocketmq.Producer, log *logrus.Logger, dlp *repository.DeadLetterProducer) *OrderForwarder {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "pod-unknown"
@@ -66,6 +68,7 @@ func NewOrderForwarder(rdb *redis.Client, producer rocketmq.Producer, log *logru
 		producer: producer,
 		log:      log,
 		cb:       gobreaker.NewCircuitBreaker(st),
+		dlp:      dlp,
 		consumer: fmt.Sprintf("forwarder-%s", hostname),
 	}
 	f.registerMetrics()
@@ -188,6 +191,8 @@ func (f *OrderForwarder) processMessages(ctx context.Context, messages []redis.X
 		payloadStr, ok := msg.Values["payload"].(string)
 		if !ok {
 			f.log.Errorf("[Forwarder] Invalid message format: missing 'payload', id=%s", msg.ID)
+			// 永久性解析错误 -> 写入死信队列
+			f.dlp.SendToDeadLetter(ctx, streamKeyOrder, forwarderGroup, msg.ID, "", "payload field missing or invalid type")
 			f.rdb.XAck(ctx, streamKeyOrder, forwarderGroup, msg.ID)
 			continue
 		}
@@ -196,6 +201,8 @@ func (f *OrderForwarder) processMessages(ctx context.Context, messages []redis.X
 		var orderData map[string]interface{}
 		if err := json.Unmarshal([]byte(payloadStr), &orderData); err != nil {
 			f.log.Errorf("[Forwarder] Invalid JSON payload, id=%s, err=%v", msg.ID, err)
+			// 永久性解析错误 -> 写入死信队列（保留原始 payload）
+			f.dlp.SendToDeadLetter(ctx, streamKeyOrder, forwarderGroup, msg.ID, payloadStr, fmt.Sprintf("json unmarshal failed: %v", err))
 			f.rdb.XAck(ctx, streamKeyOrder, forwarderGroup, msg.ID)
 			continue
 		}
@@ -272,8 +279,9 @@ func (f *OrderForwarder) sequentialSend(ctx context.Context, msgs []*primitive.M
 				f.log.Warnf("[Forwarder Sequential] Transient error for msg (streamID=%s): %v. Will retry via recovery.", msgIDs[i], err)
 				retryMsgIDs = append(retryMsgIDs, msgIDs[i])
 			} else {
-				// 永久故障（Topic 不存在、消息体非法等）：ACK 防止阻塞
-				f.log.Errorf("[Forwarder Sequential] Permanent error for msg (streamID=%s): %v. ACKing to prevent blocking.", msgIDs[i], err)
+				// 永久故障（Topic 不存在、消息体非法等）：写入死信队列 + ACK 防止阻塞
+				f.log.Errorf("[Forwarder Sequential] Permanent error for msg (streamID=%s): %v. Sending to dead stream.", msgIDs[i], err)
+				f.dlp.SendToDeadLetter(ctx, streamKeyOrder, forwarderGroup, msgIDs[i], string(msg.Body), fmt.Sprintf("permanent MQ error: %v", err))
 				ackIDs = append(ackIDs, msgIDs[i])
 			}
 			continue
@@ -286,8 +294,9 @@ func (f *OrderForwarder) sequentialSend(ctx context.Context, msgs []*primitive.M
 			f.log.Warnf("[Forwarder Sequential] Transient send status for msg (streamID=%s): %v. Will retry via recovery.", msgIDs[i], res.Status)
 			retryMsgIDs = append(retryMsgIDs, msgIDs[i])
 		} else {
-			// 未知状态：ACK 防止阻塞
-			f.log.Errorf("[Forwarder Sequential] Unknown send status for msg (streamID=%s): %v. ACKing to prevent blocking.", msgIDs[i], res.Status)
+			// 未知状态：写入死信队列 + ACK 防止阻塞
+			f.log.Errorf("[Forwarder Sequential] Unknown send status for msg (streamID=%s): %v. Sending to dead stream.", msgIDs[i], res.Status)
+			f.dlp.SendToDeadLetter(ctx, streamKeyOrder, forwarderGroup, msgIDs[i], string(msg.Body), fmt.Sprintf("unknown send status: %v", res.Status))
 			ackIDs = append(ackIDs, msgIDs[i])
 		}
 	}

@@ -43,6 +43,7 @@ type cachedRepo struct {
 	cb            *gobreaker.CircuitBreaker
 	deductScript  *redis.Script
 	restockScript *redis.Script
+	dlp           *DeadLetterProducer // 死信队列生产者
 	consumerName  string
 	meter         metric.Meter
 
@@ -181,6 +182,7 @@ func NewCachedRepo(next ProductRepository, rdb *redis.Client, db *gorm.DB, log *
 		cb:            gobreaker.NewCircuitBreaker(st),
 		deductScript:  script,
 		restockScript: restockScript,
+		dlp:           NewDeadLetterProducer(rdb, log),
 		consumerName:  consumerName,
 		meter:         otel.GetMeterProvider().Meter("productcatalogservice.repo"),
 	}
@@ -685,6 +687,9 @@ func (c *cachedRepo) parseStockMessages(ctx context.Context, messages []redis.XM
 		payloadStr, ok := msg.Values["payload"].(string)
 		if !ok {
 			c.log.Errorf("[Flush] Msg %s has no payload or invalid type", msg.ID)
+			// 永久性解析错误 -> 写入死信队列
+			c.dlp.SendToDeadLetter(ctx, streamKey, streamGroup, msg.ID, "", "payload field missing or invalid type")
+			c.rdb.XAck(ctx, streamKey, streamGroup, msg.ID)
 			continue
 		}
 
@@ -696,6 +701,9 @@ func (c *cachedRepo) parseStockMessages(ctx context.Context, messages []redis.XM
 
 		if err := json.Unmarshal([]byte(payloadStr), &payloadObj); err != nil {
 			c.log.Errorf("[Flush] Failed to unmarshal payload for msg %s: %v", msg.ID, err)
+			// 永久性解析错误 -> 写入死信队列（保留原始 payload 用于排查）
+			c.dlp.SendToDeadLetter(ctx, streamKey, streamGroup, msg.ID, payloadStr, fmt.Sprintf("json unmarshal failed: %v", err))
+			c.rdb.XAck(ctx, streamKey, streamGroup, msg.ID)
 			continue
 		}
 
@@ -783,8 +791,9 @@ func (c *cachedRepo) sequentialFlush(ctx context.Context, parsed []parsedStockMs
 				c.log.Warnf("[Flush Sequential] Transient error for msg %s (order: %s): %v. Will retry via recovery.", p.msgID, p.oid, err)
 				retryMsgIDs = append(retryMsgIDs, p.msgID)
 			} else {
-				// 永久故障（数据约束冲突、语法错误）：ACK 防止阻塞
-				c.log.Errorf("[Flush Sequential] Permanent error for msg %s (order: %s): %v. ACKing to prevent queue blocking.", p.msgID, p.oid, err)
+				// 永久故障（数据约束冲突、语法错误）：写入死信队列 + ACK 防止阻塞
+				c.log.Errorf("[Flush Sequential] Permanent error for msg %s (order: %s): %v. Sending to dead stream.", p.msgID, p.oid, err)
+				c.dlp.SendToDeadLetter(ctx, streamKey, streamGroup, p.msgID, fmt.Sprintf("{\"oid\":\"%s\"}", p.oid), fmt.Sprintf("permanent DB error: %v", err))
 			}
 		} else {
 			c.log.Infof("[Flush Sequential] Successfully flushed msg %s (order: %s)", p.msgID, p.oid)
