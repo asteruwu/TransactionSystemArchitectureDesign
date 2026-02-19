@@ -96,9 +96,7 @@ src/
 │   │   ├── consumer.go          # RocketMQ Consumer (订单创建 + 状态更新 + 发货)
 │   │   ├── cleanup.go           # 超时订单清理 Worker
 │   │   ├── shipping_recover.go  # 发货补偿 Worker
-│   │   ├── dlq.go               # 死信队列监控 Consumer
-│   │   ├── shipment_flusher.go  # 发货记录批量刷盘
-│   │   └── stream.go            # Redis Stream Worker (备用)
+│   │   └── dlq.go               # 死信队列监控 Consumer
 │   └── pkg/client/
 │       └── payment_client.go    # Payment 客户端 (熔断器 + 超时)
 │
