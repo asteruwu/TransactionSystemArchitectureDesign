@@ -162,6 +162,7 @@ func (w *OrderCleanupWorker) processExpiredOrders(ctx context.Context) {
 
 	// 4. 逐个回滚未支付订单库存，收集成功的
 	cancelledOrders := make([]string, 0, len(unpaidOrders))
+	cleanupFailedOrders := make([]string, 0) // 永久故障，需标记为 CLEANUP_FAILED
 	for _, order := range unpaidOrders {
 		restockReq := &pb.RestockProductRequest{
 			OrderId: order.OrderID,
@@ -170,8 +171,24 @@ func (w *OrderCleanupWorker) processExpiredOrders(ctx context.Context) {
 
 		_, err := w.catalogClient.RestockProduct(ctx, restockReq)
 		if err != nil {
-			w.logger.Errorf("[CleanupWorker] Restock failed for %s: %v. Will retry next tick.", order.OrderID, err)
-			atomic.AddUint64(&w.rollbackFailTotal, 1)
+			if isTransientGRPCError(err) {
+				w.logger.Warnf("[CleanupWorker] Restock transient error for %s: %v. Will retry next tick.", order.OrderID, err)
+				atomic.AddUint64(&w.rollbackFailTotal, 1)
+			} else {
+				w.logger.Errorf("[CleanupWorker] Restock PERMANENT error for %s: %v. Marking as CLEANUP_FAILED.", order.OrderID, err)
+				atomic.AddUint64(&w.rollbackFailTotal, 1)
+
+				// 永久故障写入 failed_cleanup_logs 表
+				if logErr := w.repo.InsertFailedCleanupLog(ctx, &model.FailedCleanupLog{
+					OrderID:   order.OrderID,
+					ErrorType: "RESTOCK",
+					ErrorMsg:  err.Error(),
+				}); logErr != nil {
+					w.logger.Errorf("[CleanupWorker] Failed to insert cleanup log for %s: %v", order.OrderID, logErr)
+					continue
+				}
+				cleanupFailedOrders = append(cleanupFailedOrders, order.OrderID)
+			}
 			continue
 		}
 		atomic.AddUint64(&w.rollbackSuccessTotal, 1)
@@ -183,17 +200,56 @@ func (w *OrderCleanupWorker) processExpiredOrders(ctx context.Context) {
 		w.logger.Infof("[CleanupWorker] Cancelling %d orders after restock", len(cancelledOrders))
 		statusMap := make(map[string]int32)
 		for _, oid := range cancelledOrders {
-			statusMap[oid] = 2 // CANCELLED
+			statusMap[oid] = model.OrderStatusCancelled
 		}
 		if err := w.repo.UpdateOrderStatusBatch(ctx, statusMap); err != nil {
 			// 降级处理
 			w.logger.Warnf("[CleanupWorker] Batch update CANCELLED failed (%v), falling back to sequential", err)
 			for _, oid := range cancelledOrders {
-				if err := w.repo.UpdateOrderStatus(ctx, oid, 2); err != nil {
+				if err := w.repo.UpdateOrderStatus(ctx, oid, model.OrderStatusCancelled); err != nil {
 					w.logger.Errorf("[CleanupWorker] Failed to update CANCELLED for %s: %v", oid, err)
 				}
 			}
 		}
+	}
+
+	// 6. 批量更新永久失败的订单状态为 CLEANUP_FAILED
+	if len(cleanupFailedOrders) > 0 {
+		w.logger.Warnf("[CleanupWorker] Marking %d orders as CLEANUP_FAILED", len(cleanupFailedOrders))
+		statusMap := make(map[string]int32)
+		for _, oid := range cleanupFailedOrders {
+			statusMap[oid] = model.OrderStatusCleanupFailed
+		}
+		if err := w.repo.UpdateOrderStatusBatch(ctx, statusMap); err != nil {
+			w.logger.Errorf("[CleanupWorker] Batch update CLEANUP_FAILED failed: %v", err)
+			for _, oid := range cleanupFailedOrders {
+				if err := w.repo.UpdateOrderStatus(ctx, oid, model.OrderStatusCleanupFailed); err != nil {
+					w.logger.Errorf("[CleanupWorker] Failed to update CLEANUP_FAILED for %s: %v", oid, err)
+				}
+			}
+		}
+	}
+}
+
+// isTransientGRPCError 判断 gRPC 错误是否为临时性故障
+func isTransientGRPCError(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return true
+	}
+	switch st.Code() {
+	case codes.Unavailable:
+		return true
+	case codes.DeadlineExceeded:
+		return true
+	case codes.ResourceExhausted:
+		return true
+	case codes.Aborted:
+		return true
+	case codes.Internal:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -6,12 +6,26 @@ import (
 
 // Order Status Constants
 const (
-	OrderStatusPending    = 0
-	OrderStatusPaid       = 1
-	OrderStatusCancelled  = 2
-	OrderStatusShipped    = 3
-	OrderStatusShipFailed = 4
+	OrderStatusPending       = 0
+	OrderStatusPaid          = 1
+	OrderStatusCancelled     = 2
+	OrderStatusShipped       = 3
+	OrderStatusShipFailed    = 4
+	OrderStatusCleanupFailed = 5 // 库存回滚永久失败，等待人工介入
 )
+
+// FailedCleanupLog 记录 CleanupWorker 中永久性失败的回滚操作
+type FailedCleanupLog struct {
+	OrderID   string    `gorm:"primaryKey;type:varchar(64)" json:"order_id"`
+	ErrorType string    `gorm:"type:varchar(32)" json:"error_type"` // RESTOCK / PAYMENT
+	ErrorMsg  string    `gorm:"type:text" json:"error_msg"`
+	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
+	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
+}
+
+func (FailedCleanupLog) TableName() string {
+	return "failed_cleanup_logs"
+}
 
 type Money struct {
 	CurrencyCode string `gorm:"type:char(3);comment:ISO 4217 currency code" json:"currency_code"`

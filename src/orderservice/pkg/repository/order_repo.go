@@ -23,6 +23,7 @@ type OrderRepo interface {
 	UpdateOrdersAndInsertShipmentsBatch(ctx context.Context, shipments []*model.Shipment) error
 	ListOrdersByUser(ctx context.Context, userID string) ([]*model.Order, error)
 	GetShipment(ctx context.Context, orderID string) (*model.Shipment, error)
+	InsertFailedCleanupLog(ctx context.Context, log *model.FailedCleanupLog) error
 }
 
 type mysqlRepo struct {
@@ -220,4 +221,9 @@ func (r *mysqlRepo) GetShipment(ctx context.Context, orderID string) (*model.Shi
 		return nil, err
 	}
 	return &shipment, nil
+}
+
+// [CleanupWorker] 记录永久性回滚失败（Upsert：同一 order_id 自动去重更新）
+func (r *mysqlRepo) InsertFailedCleanupLog(ctx context.Context, log *model.FailedCleanupLog) error {
+	return r.db.WithContext(ctx).Save(log).Error
 }

@@ -251,7 +251,7 @@ func initDB() repository.OrderRepo {
 	}
 
 	// Migrate both Order tables and FailedOrder table, and Shipment (New)
-	db.AutoMigrate(&model.Order{}, &model.OrderItem{}, &model.FailedOrder{}, &model.Shipment{})
+	db.AutoMigrate(&model.Order{}, &model.OrderItem{}, &model.FailedOrder{}, &model.Shipment{}, &model.FailedCleanupLog{})
 	repo := repository.NewOrderRepo(db)
 	log.Info("connected to mysql")
 
