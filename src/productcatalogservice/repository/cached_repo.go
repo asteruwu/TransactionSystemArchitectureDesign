@@ -604,9 +604,15 @@ func (c *cachedRepo) flushBufferToMySQL(ctx context.Context, messages []redis.XM
 	for _, msg := range messages {
 		msgIDList = append(msgIDList, msg.ID)
 	}
+	var retryMsgIDs []string
 
-	// 2. 解析所有消息（解析阶段独立于事务，可复用）
-	parsed, traceLinks := c.parseStockMessages(ctx, messages)
+	// 2. 解析所有消息（传入 retryMsgIDs，解析/DLQ 失败的消息 ID 会被 append 进去）
+	parsed, traceLinks, err := c.parseStockMessages(ctx, messages, &retryMsgIDs)
+	if err != nil {
+		c.log.Errorf("[Flush] Abort batch due to dedup check failure: %v", err)
+		atomic.AddUint64(&c.flushFailTotal, 1)
+		return
+	}
 
 	// 3. 创建 Trace Span
 	tracer := otel.Tracer("productcatalogservice-repo")
@@ -617,14 +623,13 @@ func (c *cachedRepo) flushBufferToMySQL(ctx context.Context, messages []redis.XM
 	defer flushSpan.End()
 
 	// 4. 尝试批量事务写入
-	var retryMsgIDs []string // 临时失败的消息 ID，不 ACK
 	if len(parsed) > 0 {
 		if err := c.batchFlush(ctx, parsed); err != nil {
 			// 批量失败 -> 降级为逐条事务
 			c.log.Warnf("[Flush] Batch transaction failed (%v), falling back to sequential", err)
 			flushSpan.RecordError(err)
 			atomic.AddUint64(&c.flushFailTotal, 1)
-			retryMsgIDs = c.sequentialFlush(ctx, parsed)
+			retryMsgIDs = append(retryMsgIDs, c.sequentialFlush(ctx, parsed)...)
 		} else {
 			atomic.AddUint64(&c.flushSuccessTotal, 1)
 		}
@@ -656,7 +661,7 @@ func (c *cachedRepo) flushBufferToMySQL(ctx context.Context, messages []redis.XM
 }
 
 // parseStockMessages 解析原始 Redis Stream 消息，过滤重复和无效消息
-func (c *cachedRepo) parseStockMessages(ctx context.Context, messages []redis.XMessage) ([]parsedStockMsg, []trace.Link) {
+func (c *cachedRepo) parseStockMessages(ctx context.Context, messages []redis.XMessage, retryMsgIDs *[]string) ([]parsedStockMsg, []trace.Link, error) {
 	// 批量查询已处理的消息 ID（幂等检查）
 	msgIDList := make([]string, 0, len(messages))
 	for _, msg := range messages {
@@ -668,7 +673,7 @@ func (c *cachedRepo) parseStockMessages(ctx context.Context, messages []redis.XM
 		Where("msg_id IN ?", msgIDList).
 		Pluck("msg_id", &existedIDs).Error; err != nil {
 		c.log.Errorf("[Flush] Failed to check dedup log: %v", err)
-		return nil, nil
+		return nil, nil, fmt.Errorf("dedup check failed: %w", err)
 	}
 
 	existedMap := make(map[string]bool, len(existedIDs))
@@ -687,9 +692,12 @@ func (c *cachedRepo) parseStockMessages(ctx context.Context, messages []redis.XM
 		payloadStr, ok := msg.Values["payload"].(string)
 		if !ok {
 			c.log.Errorf("[Flush] Msg %s has no payload or invalid type", msg.ID)
-			// 永久性解析错误 -> 写入死信队列
-			c.dlp.SendToDeadLetter(ctx, streamKey, streamGroup, msg.ID, "", "payload field missing or invalid type")
-			c.rdb.XAck(ctx, streamKey, streamGroup, msg.ID)
+			// 永久性解析错误 -> 尝试写入死信队列
+			if dlqErr := c.dlp.SendToDeadLetter(ctx, streamKey, streamGroup, msg.ID, "", "payload field missing or invalid type"); dlqErr != nil {
+				c.log.Errorf("[Flush] DLQ write also failed for msg %s: %v. Skip ACK.", msg.ID, dlqErr)
+				*retryMsgIDs = append(*retryMsgIDs, msg.ID)
+			}
+			// DLQ 成功则不加入 parsed 也不加入 retryMsgIDs -> 外层会 ACK
 			continue
 		}
 
@@ -701,9 +709,12 @@ func (c *cachedRepo) parseStockMessages(ctx context.Context, messages []redis.XM
 
 		if err := json.Unmarshal([]byte(payloadStr), &payloadObj); err != nil {
 			c.log.Errorf("[Flush] Failed to unmarshal payload for msg %s: %v", msg.ID, err)
-			// 永久性解析错误 -> 写入死信队列（保留原始 payload 用于排查）
-			c.dlp.SendToDeadLetter(ctx, streamKey, streamGroup, msg.ID, payloadStr, fmt.Sprintf("json unmarshal failed: %v", err))
-			c.rdb.XAck(ctx, streamKey, streamGroup, msg.ID)
+			// 永久性解析错误 -> 尝试写入死信队列（保留原始 payload 用于排查）
+			if dlqErr := c.dlp.SendToDeadLetter(ctx, streamKey, streamGroup, msg.ID, payloadStr, fmt.Sprintf("json unmarshal failed: %v", err)); dlqErr != nil {
+				c.log.Errorf("[Flush] DLQ write also failed for msg %s: %v. Skip ACK.", msg.ID, dlqErr)
+				*retryMsgIDs = append(*retryMsgIDs, msg.ID)
+			}
+			// DLQ 成功则不加入 parsed 也不加入 retryMsgIDs -> 外层会 ACK
 			continue
 		}
 
@@ -719,7 +730,7 @@ func (c *cachedRepo) parseStockMessages(ctx context.Context, messages []redis.XM
 		}
 	}
 
-	return parsed, traceLinks
+	return parsed, traceLinks, nil
 }
 
 // batchFlush 批量事务：聚合所有消息后一次性写入 MySQL
