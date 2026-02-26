@@ -7,7 +7,7 @@ type FailedOrder struct {
 	OrderID      string    `gorm:"index" json:"order_id"`
 	OriginalJSON string    `gorm:"type:text" json:"original_json"`
 	ErrorReason  string    `gorm:"type:varchar(255)" json:"error_reason"`
-	CreatedAt    time.Time `gorm:"autoCreateTime" json:"created_at"`
+	CreatedAt    time.Time `gorm:"autoCreateTime;index" json:"created_at"`
 }
 
 func (FailedOrder) TableName() string {
