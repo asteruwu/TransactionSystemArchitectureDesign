@@ -3,10 +3,12 @@ package repository
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/pkg/model"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type OrderRepo interface {
@@ -69,9 +71,14 @@ func (r *mysqlRepo) GetOrdersByIDs(ctx context.Context, orderIDs []string) ([]*m
 // [order_status Consumer] Batch更新失败，整批回滚，逐消息更新
 func (r *mysqlRepo) UpdateOrderStatus(ctx context.Context, orderID string, status int32) error {
 	// 防回滚：只有新状态大于当前状态时才更新
+	updates := map[string]any{"status": status}
+	if status == model.OrderStatusPaid {
+		now := time.Now()
+		updates["paid_at"] = now
+	}
 	res := r.db.WithContext(ctx).Model(&model.Order{}).
 		Where("order_id = ? AND status < ?", orderID, status).
-		Update("status", status)
+		Updates(updates)
 
 	if res.Error != nil {
 		return res.Error
@@ -94,26 +101,36 @@ func (r *mysqlRepo) GetExpiredPendingOrders(ctx context.Context, delay time.Dura
 }
 
 // [order_status Consumer] 常规路径
-// SET status {CASE... THEN...}
+// SET status {CASE... THEN...}, paid_at {CASE... THEN...}
 func (r *mysqlRepo) UpdateOrderStatusBatch(ctx context.Context, statuses map[string]int32) error {
 	if len(statuses) == 0 {
 		return nil
 	}
 
-	caseStmt := "CASE order_id"
-	ids := make([]interface{}, 0, len(statuses))
-	params := make([]interface{}, 0, len(statuses)*2)
+	var statusBuilder, paidAtBuilder strings.Builder
+	statusBuilder.WriteString("CASE order_id")
+	paidAtBuilder.WriteString("CASE order_id")
+
+	ids := make([]any, 0, len(statuses))
+	statusParams := make([]any, 0, len(statuses)*3)
+	paidAtParams := make([]any, 0)
 
 	for oid, status := range statuses {
-		caseStmt += " WHEN ? THEN IF(status < ?, ?, status)"
-		params = append(params, oid, status, status)
+		statusBuilder.WriteString(" WHEN ? THEN IF(status < ?, ?, status)")
+		statusParams = append(statusParams, oid, status, status)
 		ids = append(ids, oid)
+		if status == model.OrderStatusPaid {
+			paidAtBuilder.WriteString(" WHEN ? THEN COALESCE(paid_at, NOW())")
+			paidAtParams = append(paidAtParams, oid)
+		}
 	}
-	caseStmt += " ELSE status END"
+	statusBuilder.WriteString(" ELSE status END")
+	paidAtBuilder.WriteString(" ELSE paid_at END")
 
-	query := fmt.Sprintf("UPDATE orders SET status = %s WHERE order_id IN ?", caseStmt)
+	params := append(statusParams, paidAtParams...)
 	params = append(params, ids)
 
+	query := fmt.Sprintf("UPDATE orders SET status = %s, paid_at = %s WHERE order_id IN ?", statusBuilder.String(), paidAtBuilder.String())
 	return r.db.WithContext(ctx).Exec(query, params...).Error
 }
 
@@ -156,7 +173,7 @@ func (r *mysqlRepo) GetPaidOrders(ctx context.Context, delay time.Duration, limi
 	// Status 1 = PAID
 	err := r.db.WithContext(ctx).
 		Preload("Items").
-		Where("status = ? AND created_at < ?", 1, threshold).
+		Where("status = ? AND paid_at < ?", 1, threshold).
 		Limit(limit).
 		Find(&orders).Error
 	return orders, err
@@ -169,33 +186,37 @@ func (r *mysqlRepo) UpdateOrdersAndInsertShipmentsBatch(ctx context.Context, shi
 	}
 
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 1. 批量插入 Shipments
-		if err := tx.CreateInBatches(shipments, 100).Error; err != nil {
-			return err
+		// 1. 批量插入 Shipments（INSERT IGNORE：重复 order_id 静默跳过，不触发事务回滚）
+		insertResult := tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(shipments, 100)
+		if insertResult.Error != nil {
+			return insertResult.Error
 		}
+		newlyInserted := insertResult.RowsAffected
 
 		// 2. 批量更新 Orders 状态
-		caseStmt := "CASE order_id"
-		ids := make([]interface{}, 0, len(shipments))
-		params := make([]interface{}, 0, len(shipments)*2)
+		var caseBuilder strings.Builder
+		caseBuilder.WriteString("CASE order_id")
+		ids := make([]any, 0, len(shipments))
+		params := make([]any, 0, len(shipments)*2)
 
 		for _, s := range shipments {
-			caseStmt += " WHEN ? THEN ?"
+			caseBuilder.WriteString(" WHEN ? THEN ?")
 			params = append(params, s.OrderID, s.Status)
 			ids = append(ids, s.OrderID)
 		}
-		caseStmt += " ELSE status END"
+		caseBuilder.WriteString(" ELSE status END")
 
-		query := fmt.Sprintf("UPDATE orders SET status = %s WHERE order_id IN ?", caseStmt)
+		query := fmt.Sprintf("UPDATE orders SET status = %s WHERE order_id IN ?", caseBuilder.String())
 		params = append(params, ids)
 
 		result := tx.Exec(query, params...)
 		if result.Error != nil {
 			return result.Error
 		}
-		// 检查是否所有订单都被更新（订单必须存在）
-		if result.RowsAffected != int64(len(shipments)) {
-			return fmt.Errorf("not all orders updated, expected %d, got %d (some orders may not exist yet)", len(shipments), result.RowsAffected)
+
+		// 更新状态的订单数 < 插入shipments订单数，说明有订单尚未创建
+		if result.RowsAffected < newlyInserted {
+			return fmt.Errorf("not all orders updated, expected at least %d, got %d (some orders may not exist yet)", newlyInserted, result.RowsAffected)
 		}
 		return nil
 	})

@@ -38,9 +38,10 @@ type Order struct {
 	UserID          string    `gorm:"type:varchar(64);index" json:"user_id"`
 	ShippingAddress string    `gorm:"type:text" json:"shipping_address"`
 	TotalPrice      Money     `gorm:"embedded;embeddedPrefix:total_price_" json:"total_price"`
-	Status          int32     `gorm:"type:int;index:idx_status_created_at,priority:1" json:"status"`
-	CreatedAt       time.Time `gorm:"index:idx_status_created_at,priority:2" json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	Status    int32      `gorm:"type:int;index:idx_status_created_at,priority:1;index:idx_status_paid_at,priority:1" json:"status"`
+	CreatedAt time.Time  `gorm:"index:idx_status_created_at,priority:2" json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+	PaidAt    *time.Time `gorm:"index:idx_status_paid_at,priority:2" json:"paid_at,omitempty"`
 
 	Items []OrderItem `gorm:"foreignKey:OrderID;references:OrderID" json:"items"`
 }
