@@ -16,7 +16,7 @@ const (
 
 // FailedCleanupLog 记录 CleanupWorker 中永久性失败的回滚操作
 type FailedCleanupLog struct {
-	OrderID   string    `gorm:"primaryKey;type:varchar(64)" json:"order_id"`
+	OrderID   string    `gorm:"primaryKey;type:char(26)" json:"order_id"`
 	ErrorType string    `gorm:"type:varchar(32)" json:"error_type"` // RESTOCK / PAYMENT
 	ErrorMsg  string    `gorm:"type:text" json:"error_msg"`
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
@@ -34,21 +34,21 @@ type Money struct {
 }
 
 type Order struct {
-	OrderID         string    `gorm:"primaryKey;type:varchar(64)" json:"order_id"`
-	UserID          string    `gorm:"type:varchar(64);index" json:"user_id"`
-	ShippingAddress string    `gorm:"type:text" json:"shipping_address"`
-	TotalPrice      Money     `gorm:"embedded;embeddedPrefix:total_price_" json:"total_price"`
-	Status    int32      `gorm:"type:int;index:idx_status_created_at,priority:1;index:idx_status_paid_at,priority:1" json:"status"`
-	CreatedAt time.Time  `gorm:"index:idx_status_created_at,priority:2" json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
-	PaidAt    *time.Time `gorm:"index:idx_status_paid_at,priority:2" json:"paid_at,omitempty"`
+	OrderID         string     `gorm:"primaryKey;type:char(26)" json:"order_id"`
+	UserID          string     `gorm:"type:varchar(64);index" json:"user_id"`
+	ShippingAddress string     `gorm:"type:text" json:"shipping_address"`
+	TotalPrice      Money      `gorm:"embedded;embeddedPrefix:total_price_" json:"total_price"`
+	Status          int32      `gorm:"type:int;index:idx_status_created_at,priority:1;index:idx_status_paid_at,priority:1" json:"status"`
+	CreatedAt       time.Time  `gorm:"index:idx_status_created_at,priority:2" json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	PaidAt          *time.Time `gorm:"index:idx_status_paid_at,priority:2" json:"paid_at,omitempty"`
 
 	Items []OrderItem `gorm:"foreignKey:OrderID;references:OrderID" json:"items"`
 }
 
 type OrderItem struct {
 	ID        uint   `gorm:"primaryKey"`
-	OrderID   string `gorm:"type:varchar(64);index"`
+	OrderID   string `gorm:"type:char(26);index"`
 	ProductID string `gorm:"type:varchar(64)" json:"product_id"`
 	Quantity  int32  `gorm:"type:int" json:"quantity"`
 	Cost      Money  `gorm:"embedded;embeddedPrefix:cost_" json:"cost"`
@@ -56,7 +56,7 @@ type OrderItem struct {
 
 // Shipment Model
 type Shipment struct {
-	OrderID    string    `gorm:"primaryKey;type:varchar(64)" json:"order_id"`
+	OrderID    string    `gorm:"primaryKey;type:char(26)" json:"order_id"`
 	TrackingID string    `gorm:"type:varchar(128);not null" json:"tracking_id"`
 	Status     int32     `gorm:"type:tinyint;not null" json:"status"` // 3=SHIPPED, 4=FAILED
 	ErrorMsg   string    `gorm:"type:text" json:"error_msg"`

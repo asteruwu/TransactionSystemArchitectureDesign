@@ -10,7 +10,7 @@ import (
 	"github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/pkg/model"
 	"github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/pkg/repository"
 	"github.com/apache/rocketmq-client-go/v2/primitive"
-	"github.com/google/uuid"
+	"github.com/oklog/ulid/v2"
 	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
@@ -46,12 +46,8 @@ func NewOrderService(catalogClient pb.ProductCatalogServiceClient, paymentClient
 
 // 扣减库存，生成订单，支付扣款，异步发货
 func (s *OrderService) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*pb.CreateOrderResponse, error) {
-	// 1. 生成带有时间序特征的 UUIDv7
-	id, err := uuid.NewV7()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate order_id: %v", err)
-	}
-	orderID := id.String()
+	// 1. 生成基于时间的 ULID
+	orderID := ulid.Make().String()
 
 	// 2. 校验价格
 	if req.TotalPrice == nil {

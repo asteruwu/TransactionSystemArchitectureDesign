@@ -4,7 +4,7 @@ import "time"
 
 type FailedOrder struct {
 	ID           int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	OrderID      string    `gorm:"index" json:"order_id"`
+	OrderID      string    `gorm:"type:char(26);index" json:"order_id"`
 	OriginalJSON string    `gorm:"type:text" json:"original_json"`
 	ErrorReason  string    `gorm:"type:varchar(255)" json:"error_reason"`
 	CreatedAt    time.Time `gorm:"autoCreateTime;index" json:"created_at"`

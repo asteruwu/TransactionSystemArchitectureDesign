@@ -62,7 +62,7 @@ type cachedRepo struct {
 
 type StockDedupLog struct {
 	MsgID     string `gorm:"primaryKey;column:msg_id"`
-	ProductID string `gorm:"column:product_id"`
+	ProductID string `gorm:"column:product_id;type:char(26)"`
 	CreatedAt time.Time
 }
 
