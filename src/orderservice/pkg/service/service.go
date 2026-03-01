@@ -9,7 +9,7 @@ import (
 	pb "github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/genproto"
 	"github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/pkg/model"
 	"github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/pkg/repository"
-	"github.com/apache/rocketmq-client-go/v2/primitive"
+	rmq_client "github.com/apache/rocketmq-clients/golang/v5"
 	"github.com/oklog/ulid/v2"
 	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
@@ -20,7 +20,7 @@ import (
 )
 
 type MQProducer interface {
-	SendSync(ctx context.Context, msgs ...*primitive.Message) (*primitive.SendResult, error)
+	Send(ctx context.Context, msg *rmq_client.Message) ([]*rmq_client.SendReceipt, error)
 }
 
 type OrderService struct {
@@ -111,21 +111,24 @@ func (s *OrderService) sendOrderStatusEvent(ctx context.Context, orderID, status
 	data, _ := json.Marshal(event)
 
 	// 发送消息到mq
-	msg := primitive.NewMessage("order_status_events", data)
-	msg.WithKeys([]string{orderID})
+	msg := &rmq_client.Message{
+		Topic: "order_status_events",
+		Body:  data,
+	}
+	msg.SetKeys(orderID)
 
 	// 注入 Trace Context 到 MQ 消息属性，确保下游 Consumer 能关联链路
 	carrier := propagation.MapCarrier{}
 	otel.GetTextMapPropagator().Inject(ctx, carrier)
 	for k, v := range carrier {
-		msg.WithProperty(k, v)
+		msg.AddProperty(k, v)
 	}
 
-	res, err := s.producer.SendSync(ctx, msg)
+	receipts, err := s.producer.Send(ctx, msg)
 	if err != nil {
 		logrus.Errorf("[OrderService] Failed to send status event (%s) for order %s: %v", status, orderID, err)
-	} else {
-		logrus.Infof("[OrderService] Sent status event (%s) for order %s. MsgID: %s", status, orderID, res.MsgID)
+	} else if len(receipts) > 0 {
+		logrus.Infof("[OrderService] Sent status event (%s) for order %s. MsgID: %s", status, orderID, receipts[0].MessageID)
 	}
 }
 

@@ -18,8 +18,8 @@ import (
 	"github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/pkg/worker"
 
 	pb "github.com/GoogleCloudPlatform/microservices-demo/src/orderservice/genproto"
-	rocketmq "github.com/apache/rocketmq-client-go/v2"
-	"github.com/apache/rocketmq-client-go/v2/producer"
+	rmq_client "github.com/apache/rocketmq-clients/golang/v5"
+	"github.com/apache/rocketmq-clients/golang/v5/credentials"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
@@ -95,28 +95,34 @@ func main() {
 	// Init RocketMQ Producer
 	rocketmqAddr := os.Getenv("ROCKETMQ_NAMESERVER")
 	if rocketmqAddr == "" {
-		rocketmqAddr = "localhost:9876"
+		rocketmqAddr = "localhost:8081"
 	}
+	rocketmqAccessKey := os.Getenv("ROCKETMQ_ACCESS_KEY")
+	rocketmqAccessSecret := os.Getenv("ROCKETMQ_ACCESS_SECRET")
 
-	// RocketMQ Go 客户端不支持主机名，需要解析为 IP 地址
-	resolvedAddr := resolveToIP(rocketmqAddr)
-	log.Infof("RocketMQ NameServer: %s -> %s", rocketmqAddr, resolvedAddr)
+	// RocketMQ v5 SDK 使用 endpoint（proxy 地址），支持主机名
+	resolvedAddr := rocketmqAddr
+	log.Infof("RocketMQ Endpoint: %s", resolvedAddr)
 
-	p, err := rocketmq.NewProducer(
-		producer.WithNameServer([]string{resolvedAddr}),
-		producer.WithGroupName("order_stream_producer_group"),
-		producer.WithRetry(2),
+	p, err := rmq_client.NewProducer(
+		&rmq_client.Config{
+			Endpoint:      resolvedAddr,
+			ConsumerGroup: "order_stream_producer_group",
+			Credentials: &credentials.SessionCredentials{
+				AccessKey:    rocketmqAccessKey,
+				AccessSecret: rocketmqAccessSecret,
+			},
+		},
+		rmq_client.WithTopics("order_status_events", "%DLQ%order_db_group", "%DLQ%order_status_group"),
 	)
 	if err != nil {
 		log.Fatalf("Failed to create producer: %v", err)
 	}
 
-	// [新增] 必须显式启动 Producer
-	err = p.Start()
-	if err != nil {
+	if err = p.Start(); err != nil {
 		log.Fatalf("Failed to start producer: %v", err)
 	}
-	defer p.Shutdown()
+	defer p.GracefulStop()
 	// 4. Init gRPC Clients (Needed for TimeoutWorker and Service)
 	catalogAddr := os.Getenv("PRODUCT_CATALOG_SERVICE_ADDR")
 	if catalogAddr == "" {
@@ -148,7 +154,7 @@ func main() {
 	shippingClient := pb.NewShippingServiceClient(shippingConn)
 
 	// 5. Start RocketMQ Consumer (订单创建 - 由 ProductCatalog Forwarder 转发)
-	consumerWorker, err := worker.NewConsumerWorker([]string{resolvedAddr}, "order_db_group", p, repo, shippingClient, log)
+	consumerWorker, err := worker.NewConsumerWorker(resolvedAddr, "order_db_group", rocketmqAccessKey, rocketmqAccessSecret, p, repo, shippingClient, log)
 	if err != nil {
 		log.Fatalf("Failed to init consumer: %v", err)
 	}
@@ -156,7 +162,7 @@ func main() {
 	go consumerWorker.Start(ctx, wg, "orders")
 
 	// 7. Start RocketMQ Status Consumer
-	statusConsumerWorker, err := worker.NewConsumerWorker([]string{resolvedAddr}, "order_status_group", p, repo, shippingClient, log)
+	statusConsumerWorker, err := worker.NewConsumerWorker(resolvedAddr, "order_status_group", rocketmqAccessKey, rocketmqAccessSecret, p, repo, shippingClient, log)
 	if err != nil {
 		log.Fatalf("Failed to init status consumer: %v", err)
 	}
@@ -168,8 +174,7 @@ func main() {
 	go cleanupWorker.Start(ctx, wg)
 
 	// 9. Start DLQ Consumer (Dead Letter Queue Monitoring)
-	// Monitor the default DLQ topic for our consumer group
-	dlqConsumer, err := worker.NewDLQConsumer(resolvedAddr, repo)
+	dlqConsumer, err := worker.NewDLQConsumer(resolvedAddr, rocketmqAccessKey, rocketmqAccessSecret, repo)
 	if err != nil {
 		log.Errorf("Failed to init DLQ consumer: %v", err)
 	} else {
@@ -347,34 +352,4 @@ func mustConnGRPC(ctx context.Context, conn **grpc.ClientConn, addr string) {
 	if err != nil {
 		panic(errors.Wrapf(err, "grpc: failed to connect %s", addr))
 	}
-}
-
-// resolveToIP 将 hostname:port 格式解析为 ip:port 格式
-// RocketMQ Go 客户端不支持主机名，需要先进行 DNS 解析
-func resolveToIP(addr string) string {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return addr // 无法解析则原样返回
-	}
-
-	// 检查是否已经是 IP 地址
-	if ip := net.ParseIP(host); ip != nil {
-		return addr // 已经是 IP，直接返回
-	}
-
-	// DNS 解析主机名
-	ips, err := net.LookupIP(host)
-	if err != nil || len(ips) == 0 {
-		return addr // 解析失败则原样返回
-	}
-
-	// 优先使用 IPv4 地址
-	for _, ip := range ips {
-		if ip4 := ip.To4(); ip4 != nil {
-			return net.JoinHostPort(ip4.String(), port)
-		}
-	}
-
-	// 没有 IPv4 则使用第一个 IP
-	return net.JoinHostPort(ips[0].String(), port)
 }
