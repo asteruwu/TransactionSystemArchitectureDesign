@@ -61,7 +61,11 @@ spec:
         - name: SHIPPING_SERVICE_ADDR
           value: "shippingservice:50051"
         - name: ROCKETMQ_NAMESERVER
-          value: "rocketmq-namesrv.default.svc.cluster.local:9876"
+          value: "rocketmq-proxy.default.svc.cluster.local:8080"
+        - name: ROCKETMQ_ACCESS_KEY
+          value: ""
+        - name: ROCKETMQ_ACCESS_SECRET
+          value: ""
         - name: PRODUCT_CATALOG_SERVICE_ADDR
           value: "productcatalogservice:3550"
         readinessProbe:

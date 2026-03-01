@@ -61,6 +61,19 @@ spec:
     port: 9876
     targetPort: 9876
 ---
+# RocketMQ Broker ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rocketmq-broker-config
+data:
+  broker.conf: |
+    brokerClusterName=DefaultCluster
+    brokerName=broker-a
+    brokerId=0
+    autoCreateTopicEnable=true
+    autoCreateSubscriptionGroup=true
+---
 # RocketMQ Broker Deployment
 apiVersion: apps/v1
 kind: Deployment
@@ -81,11 +94,12 @@ spec:
       containers:
       - name: broker
         image: apache/rocketmq:5.1.0
-        command: ["sh", "-c", "./mqbroker -n rocketmq-namesrv:9876 autoCreateTopicEnable=true"]
+        command: ["sh", "-c", "./mqbroker -n rocketmq-namesrv:9876 -c /home/rocketmq/conf/broker.conf"]
         ports:
         - containerPort: 10909
         - containerPort: 10911
         - containerPort: 10912
+        - containerPort: 8081
         env:
         - name: JAVA_OPT_EXT
           value: "-Xms256m -Xmx256m -Xmn128m"
@@ -101,9 +115,15 @@ spec:
         volumeMounts:
         - name: broker-storage
           mountPath: /home/rocketmq/store
+        - name: broker-config
+          mountPath: /home/rocketmq/conf/broker.conf
+          subPath: broker.conf
       volumes:
       - name: broker-storage
         emptyDir: {}
+      - name: broker-config
+        configMap:
+          name: rocketmq-broker-config
 ---
 apiVersion: v1
 kind: Service
@@ -125,3 +145,57 @@ spec:
   - name: ha
     port: 10912
     targetPort: 10912
+  - name: proxy
+    port: 8081
+    targetPort: 8081
+---
+# RocketMQ Proxy Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rocketmq-proxy
+  labels:
+    app: rocketmq-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rocketmq-proxy
+  template:
+    metadata:
+      labels:
+        app: rocketmq-proxy
+    spec:
+      containers:
+      - name: proxy
+        image: apache/rocketmq:5.1.0
+        command: ["sh", "-c", "./mqproxy -n rocketmq-namesrv:9876"]
+        ports:
+        - containerPort: 8080
+        env:
+        - name: JAVA_OPT_EXT
+          value: "-Xms256m -Xmx256m -Xmn128m"
+        - name: NAMESRV_ADDR
+          value: "rocketmq-namesrv:9876"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rocketmq-proxy
+  labels:
+    app: rocketmq-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app: rocketmq-proxy
+  ports:
+  - name: grpc
+    port: 8080
+    targetPort: 8080
