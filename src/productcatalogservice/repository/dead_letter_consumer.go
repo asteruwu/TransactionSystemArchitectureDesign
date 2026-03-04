@@ -6,10 +6,14 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	redis "github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"gorm.io/gorm"
 )
 
@@ -38,11 +42,49 @@ type DeadLetterConsumer struct {
 	rdb *redis.Client
 	db  *gorm.DB
 	log *logrus.Logger
+
+	persistSuccessTotal uint64
+	persistFailTotal    uint64
+	ackFailTotal        uint64
+	recoveryClaimTotal  uint64
 }
 
 // NewDeadLetterConsumer 构造死信消费者
 func NewDeadLetterConsumer(rdb *redis.Client, db *gorm.DB, log *logrus.Logger) *DeadLetterConsumer {
-	return &DeadLetterConsumer{rdb: rdb, db: db, log: log}
+	c := &DeadLetterConsumer{rdb: rdb, db: db, log: log}
+	c.registerMetrics()
+	return c
+}
+
+func (c *DeadLetterConsumer) registerMetrics() {
+	meter := otel.GetMeterProvider().Meter("productcatalogservice.dead_letter")
+
+	meter.Int64ObservableGauge("app_dlc_persist_total",
+		metric.WithDescription("Dead letter messages persisted to MySQL"),
+		metric.WithInt64Callback(func(_ context.Context, obs metric.Int64Observer) error {
+			obs.Observe(int64(atomic.LoadUint64(&c.persistSuccessTotal)),
+				metric.WithAttributes(attribute.String("result", "success")))
+			obs.Observe(int64(atomic.LoadUint64(&c.persistFailTotal)),
+				metric.WithAttributes(attribute.String("result", "fail")))
+			return nil
+		}),
+	)
+
+	meter.Int64ObservableGauge("app_dlc_ack_fail_total",
+		metric.WithDescription("Dead letter messages failed to ACK after persist"),
+		metric.WithInt64Callback(func(_ context.Context, obs metric.Int64Observer) error {
+			obs.Observe(int64(atomic.LoadUint64(&c.ackFailTotal)))
+			return nil
+		}),
+	)
+
+	meter.Int64ObservableGauge("app_dlc_recovery_claim_total",
+		metric.WithDescription("Dead letter messages claimed by recovery goroutine"),
+		metric.WithInt64Callback(func(_ context.Context, obs metric.Int64Observer) error {
+			obs.Observe(int64(atomic.LoadUint64(&c.recoveryClaimTotal)))
+			return nil
+		}),
+	)
 }
 
 // Start 启动死信消费者（确保消费者组 + AutoMigrate + 启动消费协程）
@@ -147,6 +189,7 @@ func (c *DeadLetterConsumer) startRecovery(ctx context.Context, wg *sync.WaitGro
 
 			if len(claimedMsgs) > 0 {
 				c.log.Infof("[DeadLetterConsumer Recovery] Claimed %d pending messages", len(claimedMsgs))
+				atomic.AddUint64(&c.recoveryClaimTotal, 1)
 				c.persistMessages(ctx, claimedMsgs)
 			}
 		}
@@ -185,6 +228,7 @@ func (c *DeadLetterConsumer) persistMessages(ctx context.Context, messages []red
 	// 批量插入 MySQL
 	if err := c.db.WithContext(ctx).Create(&records).Error; err != nil {
 		c.log.Errorf("[DeadLetterConsumer] Failed to persist %d dead messages: %v", len(records), err)
+		atomic.AddUint64(&c.persistFailTotal, 1)
 		// 不 ACK，等待下次重试
 		return
 	}
@@ -192,9 +236,11 @@ func (c *DeadLetterConsumer) persistMessages(ctx context.Context, messages []red
 	// 持久化成功 -> ACK
 	if err := c.rdb.XAck(ctx, DeadStreamKey, deadLetterGroup, ackIDs...).Err(); err != nil {
 		c.log.Errorf("[DeadLetterConsumer] Failed to ACK %d messages: %v", len(ackIDs), err)
+		atomic.AddUint64(&c.ackFailTotal, 1)
 		return
 	}
 
+	atomic.AddUint64(&c.persistSuccessTotal, 1)
 	c.log.Infof("[DeadLetterConsumer] Persisted and ACKed %d dead messages", len(records))
 }
 

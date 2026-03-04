@@ -804,7 +804,10 @@ func (c *cachedRepo) sequentialFlush(ctx context.Context, parsed []parsedStockMs
 			} else {
 				// 永久故障（数据约束冲突、语法错误）：写入死信队列 + ACK 防止阻塞
 				c.log.Errorf("[Flush Sequential] Permanent error for msg %s (order: %s): %v. Sending to dead stream.", p.msgID, p.oid, err)
-				c.dlp.SendToDeadLetter(ctx, streamKey, streamGroup, p.msgID, fmt.Sprintf("{\"oid\":\"%s\"}", p.oid), fmt.Sprintf("permanent DB error: %v", err))
+				if dlqErr := c.dlp.SendToDeadLetter(ctx, streamKey, streamGroup, p.msgID, fmt.Sprintf("{\"oid\":\"%s\"}", p.oid), fmt.Sprintf("permanent DB error: %v", err)); dlqErr != nil {
+					c.log.Errorf("[Flush Sequential] DLQ write also failed for msg %s: %v. Skip ACK.", p.msgID, dlqErr)
+					retryMsgIDs = append(retryMsgIDs, p.msgID)
+				}
 			}
 		} else {
 			c.log.Infof("[Flush Sequential] Successfully flushed msg %s (order: %s)", p.msgID, p.oid)
