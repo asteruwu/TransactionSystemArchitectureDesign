@@ -184,7 +184,7 @@ src/
 | **Redis 缓存 Miss** | SingleFlight + 回源 MySQL + SetNX 回写缓存 |
 | **库存缓存未初始化** | 最多重试 3 次，每次从 MySQL 加载后重新执行 Lua 脚本 |
 | **批量写入失败** | 降级为逐条写入，逐条失败则标记重试 (临时) 或进入 DLQ (永久) |
-| **RocketMQ 发送失败** | 临时故障由 Recovery Worker 重试；永久故障进入 Dead Stream |
+| **RocketMQ 发送失败** | 熔断器保护逐条发送；临时故障不 ACK 由 Recovery Worker 重试；永久故障进入 Dead Stream |
 | **支付 RPC 失败** | Payment Client 包装熔断器 + 3s 超时；失败返回 PENDING，由 Cleanup Worker 后续对账 |
 | **发货 RPC 失败** | 返回 `ConsumeRetryLater`，MQ 自动重试；最终由 ShippingRecoverWorker 兜底 |
 | **DLQ 发送失败** | 打印 CRITICAL 日志，返回 Success 防止卡死后续消费 |
@@ -222,8 +222,8 @@ src/
 
 | 服务 | 追踪覆盖 | 采样策略 | 特殊集成 |
 |------|----------|----------|----------|
-| **ProductCatalogService** | ✅ 完整 | `ParentBased(TraceIDRatio=0.1)` | Redis 自动埋点 (`redisotel`) + GORM 自动埋点 (`otelgorm`) |
-| **OrderService** | ✅ 完整 | `ParentBased(TraceIDRatio=0.1)` | gRPC Client/Server 自动埋点 + GORM 自动埋点 (`otelgorm`) |
+| **ProductCatalogService** | ✅ 完整 | `LoadAdaptiveSampler`（负载自适应，5s 刷新） | Redis 自动埋点 (`redisotel`) + GORM 自动埋点 (`otelgorm`) |
+| **OrderService** | ✅ 完整 | `LoadAdaptiveSampler`（负载自适应，5s 刷新） | gRPC Client/Server 自动埋点 + GORM 自动埋点 (`otelgorm`) |
 | **CheckoutService** | ✅ 完整 | `AlwaysSample` | gRPC Client/Server 自动埋点 |
 
 **追踪链路示例：**
@@ -242,6 +242,9 @@ src/
 | `app_stock_charge_success_total` | Counter | **库存扣减成功数** (Redis 层面) | `productcatalogservice` |
 | `app_shipping_success_total` | Counter | **发货成功数** (分 normal/retry 来源) | `orderservice` |
 | `app_forwarder_lag_ms` | Gauge | **转发延迟** (Redis Stream → RocketMQ) | `productcatalogservice` |
+| `app_forwarder_send_total` | Gauge | **转发结果统计** (按 result 区分：success/transient_fail/permanent_fail) | `productcatalogservice` |
+| `app_forwarder_cb_reject_total` | Gauge | **熔断器拒绝次数** | `productcatalogservice` |
+| `app_forwarder_dlq_total` | Gauge | **死信写入次数** | `productcatalogservice` |
 | `repo_flush_success_total` | Gauge | **库存落库** (Async Worker 批量刷盘成功数) | `productcatalogservice` |
 
 #### 技术亮点 (Traces)
