@@ -14,6 +14,19 @@ data:
 
     processors:
       batch:
+      tail_sampling:
+        decision_wait: 10s
+        num_traces: 10000
+        policies:
+          - name: keep-errors
+            type: status_code
+            status_code: { status_codes: [ERROR] }
+          - name: keep-high-latency
+            type: latency
+            latency: { threshold_ms: 2000 }
+          - name: normal-probabilistic
+            type: probabilistic
+            probabilistic: { sampling_percentage: 10 }
 
     exporters:
       prometheus:
@@ -35,7 +48,7 @@ data:
           exporters: [prometheus]
         traces:
           receivers: [otlp]
-          processors: [batch]
+          processors: [tail_sampling, batch]
           exporters: [otlp]
           
 

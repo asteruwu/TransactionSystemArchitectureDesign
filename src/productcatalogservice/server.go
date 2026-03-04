@@ -18,11 +18,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -249,7 +254,7 @@ func initTracing(ctx context.Context) (*sdktrace.TracerProvider, error) {
 	// 创建导出器和采样器
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
-		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(0.1))),
+		sdktrace.WithSampler(sdktrace.ParentBased(newLoadAdaptiveSampler(ctx))),
 		sdktrace.WithResource(res),
 	)
 	otel.SetTracerProvider(tp)
@@ -516,4 +521,78 @@ func resolveToIP(addr string) string {
 
 	// 没有 IPv4 则使用第一个 IP
 	return net.JoinHostPort(ips[0].String(), port)
+}
+
+type loadAdaptiveSampler struct {
+	baseRate   float64
+	goHigh     int
+	minRate    float64
+	cachedRate uint64
+}
+
+func newLoadAdaptiveSampler(ctx context.Context) *loadAdaptiveSampler {
+	base := 0.1
+	if v := os.Getenv("TRACE_SAMPLE_RATE"); v != "" {
+		if r, err := strconv.ParseFloat(v, 64); err == nil && r >= 0 && r <= 1 {
+			base = r
+		} else {
+			log.Warnf("invalid TRACE_SAMPLE_RATE=%q, using default 0.1", v)
+		}
+	}
+	high := 5000
+	if v := os.Getenv("TRACE_GOROUTINE_HIGH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			high = n
+		} else {
+			log.Warnf("invalid TRACE_GOROUTINE_HIGH=%q, using default 5000", v)
+		}
+	}
+	minR := 0.01
+	if v := os.Getenv("TRACE_SAMPLE_MIN_RATE"); v != "" {
+		if r, err := strconv.ParseFloat(v, 64); err == nil && r >= 0 && r <= 1 {
+			minR = r
+		} else {
+			log.Warnf("invalid TRACE_SAMPLE_MIN_RATE=%q, using default 0.01", v)
+		}
+	}
+
+	s := &loadAdaptiveSampler{baseRate: base, goHigh: high, minRate: minR}
+	atomic.StoreUint64(&s.cachedRate, math.Float64bits(base))
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				current := runtime.NumGoroutine()
+				rate := s.baseRate
+				if current >= s.goHigh {
+					ratio := float64(current-s.goHigh) / float64(s.goHigh)
+					if ratio > 1 {
+						ratio = 1
+					}
+					rate = s.baseRate - (s.baseRate-s.minRate)*ratio
+				}
+				atomic.StoreUint64(&s.cachedRate, math.Float64bits(rate))
+			}
+		}
+	}()
+
+	log.Infof("LoadAdaptiveSampler initialized: base=%.2f, goHigh=%d, minRate=%.2f", base, high, minR)
+	return s
+}
+
+func (s *loadAdaptiveSampler) ShouldSample(p sdktrace.SamplingParameters) sdktrace.SamplingResult {
+	rate := math.Float64frombits(atomic.LoadUint64(&s.cachedRate))
+	if rand.Float64() < rate {
+		return sdktrace.SamplingResult{Decision: sdktrace.RecordAndSample}
+	}
+	return sdktrace.SamplingResult{Decision: sdktrace.Drop}
+}
+
+func (s *loadAdaptiveSampler) Description() string {
+	return fmt.Sprintf("LoadAdaptiveSampler{base=%.2f,goHigh=%d}", s.baseRate, s.goHigh)
 }
