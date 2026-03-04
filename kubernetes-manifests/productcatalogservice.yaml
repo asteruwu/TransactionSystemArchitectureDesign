@@ -63,7 +63,11 @@ spec:
           # 端口是 26379
           value: "redis:26379"
         - name: ROCKETMQ_NAMESERVER
-          value: "rocketmq-namesrv.default.svc.cluster.local:9876"
+          value: "rocketmq-proxy.default.svc.cluster.local:8080"
+        - name: ROCKETMQ_ACCESS_KEY
+          value: ""
+        - name: ROCKETMQ_ACCESS_SECRET
+          value: ""
         readinessProbe:
           grpc:
             port: 3550

@@ -100,7 +100,7 @@ func main() {
 	// Init RocketMQ Producer
 	rocketmqAddr := os.Getenv("ROCKETMQ_NAMESERVER")
 	if rocketmqAddr == "" {
-		rocketmqAddr = "localhost:8081"
+		rocketmqAddr = "localhost:8080"
 	}
 	rocketmqAccessKey := os.Getenv("ROCKETMQ_ACCESS_KEY")
 	rocketmqAccessSecret := os.Getenv("ROCKETMQ_ACCESS_SECRET")

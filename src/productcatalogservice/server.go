@@ -36,8 +36,8 @@ import (
 	"github.com/GoogleCloudPlatform/microservices-demo/src/productcatalogservice/repository"
 	"github.com/redis/go-redis/v9"
 
-	rocketmq "github.com/apache/rocketmq-client-go/v2"
-	"github.com/apache/rocketmq-client-go/v2/producer"
+	rmq_client "github.com/apache/rocketmq-clients/golang/v5"
+	"github.com/apache/rocketmq-clients/golang/v5/credentials"
 
 	pb "github.com/GoogleCloudPlatform/microservices-demo/src/productcatalogservice/genproto"
 	"google.golang.org/grpc/credentials/insecure"
@@ -192,17 +192,23 @@ func run(port string, ctx context.Context, wg *sync.WaitGroup) (string, *grpc.Se
 	if rdb != nil {
 		rocketmqAddr := os.Getenv("ROCKETMQ_NAMESERVER")
 		if rocketmqAddr == "" {
-			rocketmqAddr = "localhost:9876"
+			rocketmqAddr = "localhost:8080"
 		}
+		rocketmqAccessKey := os.Getenv("ROCKETMQ_ACCESS_KEY")
+		rocketmqAccessSecret := os.Getenv("ROCKETMQ_ACCESS_SECRET")
 
-		// RocketMQ Go 客户端不支持主机名，需要解析为 IP 地址
-		resolvedAddr := resolveToIP(rocketmqAddr)
-		log.Infof("RocketMQ NameServer: %s -> %s", rocketmqAddr, resolvedAddr)
+		log.Infof("RocketMQ Endpoint: %s", rocketmqAddr)
 
-		mqProducer, err := rocketmq.NewProducer(
-			producer.WithNameServer([]string{resolvedAddr}),
-			producer.WithGroupName("ProductCatalog-Forwarder"),
-			producer.WithRetry(3),
+		mqProducer, err := rmq_client.NewProducer(
+			&rmq_client.Config{
+				Endpoint:      rocketmqAddr,
+				ConsumerGroup: "ProductCatalog-Forwarder",
+				Credentials: &credentials.SessionCredentials{
+					AccessKey:    rocketmqAccessKey,
+					AccessSecret: rocketmqAccessSecret,
+				},
+			},
+			rmq_client.WithTopics("order_created"),
 		)
 		if err != nil {
 			log.Warnf("Failed to create RocketMQ producer: %v (Forwarder disabled)", err)
@@ -210,6 +216,7 @@ func run(port string, ctx context.Context, wg *sync.WaitGroup) (string, *grpc.Se
 			if err := mqProducer.Start(); err != nil {
 				log.Warnf("Failed to start RocketMQ producer: %v (Forwarder disabled)", err)
 			} else {
+				defer mqProducer.GracefulStop()
 				log.Info("RocketMQ producer started, initializing Forwarder...")
 				dlp := repository.NewDeadLetterProducer(rdb, log)
 				fwd := forwarder.NewOrderForwarder(rdb, mqProducer, log, dlp)
@@ -491,36 +498,6 @@ func modelToProto(p *model.Product) *pb.Product {
 		Categories: categories,
 		Stock:      p.Stock,
 	}
-}
-
-// resolveToIP 将 hostname:port 格式解析为 ip:port 格式
-// RocketMQ Go 客户端不支持主机名，需要先进行 DNS 解析
-func resolveToIP(addr string) string {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return addr // 无法解析则原样返回
-	}
-
-	// 检查是否已经是 IP 地址
-	if ip := net.ParseIP(host); ip != nil {
-		return addr // 已经是 IP，直接返回
-	}
-
-	// DNS 解析主机名
-	ips, err := net.LookupIP(host)
-	if err != nil || len(ips) == 0 {
-		return addr // 解析失败则原样返回
-	}
-
-	// 优先使用 IPv4 地址
-	for _, ip := range ips {
-		if ip4 := ip.To4(); ip4 != nil {
-			return net.JoinHostPort(ip4.String(), port)
-		}
-	}
-
-	// 没有 IPv4 则使用第一个 IP
-	return net.JoinHostPort(ips[0].String(), port)
 }
 
 type loadAdaptiveSampler struct {

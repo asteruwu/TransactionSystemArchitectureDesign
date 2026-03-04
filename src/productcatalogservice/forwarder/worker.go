@@ -3,9 +3,7 @@ package forwarder
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -14,9 +12,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/microservices-demo/src/productcatalogservice/repository"
-	rocketmq "github.com/apache/rocketmq-client-go/v2"
-	mqerrors "github.com/apache/rocketmq-client-go/v2/errors"
-	"github.com/apache/rocketmq-client-go/v2/primitive"
+	rmq_client "github.com/apache/rocketmq-clients/golang/v5"
 	redis "github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 	"github.com/sony/gobreaker"
@@ -34,26 +30,23 @@ const (
 // OrderForwarder 从本地 Redis Stream 读取订单消息，转发至 RocketMQ
 type OrderForwarder struct {
 	rdb          *redis.Client
-	producer     rocketmq.Producer
+	producer     rmq_client.Producer
 	log          *logrus.Logger
 	cb           *gobreaker.CircuitBreaker
 	dlp          *repository.DeadLetterProducer // 死信队列生产者
 	consumer     string
 	currentLagMs int64
 
-	sendSuccessTotal      uint64
-	seqSendSuccessTotal   uint64
-	transientFailTotal    uint64
-	permanentFailTotal    uint64
-	dlqTotal              uint64
-	fallbackBatchErrTotal uint64
-	fallbackStatusNotOK   uint64
-	fallbackCBOpenTotal   uint64
-	cbState               int32 // 熔断器状态（0=closed, 1=half-open, 2=open）
+	sendSuccessTotal    uint64
+	transientFailTotal  uint64
+	permanentFailTotal  uint64
+	dlqTotal            uint64
+	fallbackCBOpenTotal uint64
+	cbState             int32 // 熔断器状态（0=closed, 1=half-open, 2=open）
 }
 
 // NewOrderForwarder 构造 Forwarder Worker
-func NewOrderForwarder(rdb *redis.Client, producer rocketmq.Producer, log *logrus.Logger, dlp *repository.DeadLetterProducer) *OrderForwarder {
+func NewOrderForwarder(rdb *redis.Client, producer rmq_client.Producer, log *logrus.Logger, dlp *repository.DeadLetterProducer) *OrderForwarder {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "pod-unknown"
@@ -106,18 +99,16 @@ func (f *OrderForwarder) registerMetrics() {
 		}),
 	)
 
-	// 2. 发送到 RocketMQ 的消息总数（按 result + mode 区分）
+	// 2. 发送到 RocketMQ 的消息总数（按 result 区分）
 	meter.Int64ObservableGauge("app_forwarder_send_total",
 		metric.WithDescription("Total messages sent to RocketMQ"),
 		metric.WithInt64Callback(func(_ context.Context, obs metric.Int64Observer) error {
 			obs.Observe(int64(atomic.LoadUint64(&f.sendSuccessTotal)),
-				metric.WithAttributes(attribute.String("result", "success"), attribute.String("mode", "batch")))
-			obs.Observe(int64(atomic.LoadUint64(&f.seqSendSuccessTotal)),
-				metric.WithAttributes(attribute.String("result", "success"), attribute.String("mode", "sequential")))
+				metric.WithAttributes(attribute.String("result", "success")))
 			obs.Observe(int64(atomic.LoadUint64(&f.transientFailTotal)),
-				metric.WithAttributes(attribute.String("result", "transient_fail"), attribute.String("mode", "sequential")))
+				metric.WithAttributes(attribute.String("result", "transient_fail")))
 			obs.Observe(int64(atomic.LoadUint64(&f.permanentFailTotal)),
-				metric.WithAttributes(attribute.String("result", "permanent_fail"), attribute.String("mode", "sequential")))
+				metric.WithAttributes(attribute.String("result", "permanent_fail")))
 			return nil
 		}),
 	)
@@ -131,14 +122,10 @@ func (f *OrderForwarder) registerMetrics() {
 		}),
 	)
 
-	// 4. 批量发送降级为逐条发送的触发次数
-	meter.Int64ObservableGauge("app_forwarder_fallback_total",
-		metric.WithDescription("Total times batch send fell back to sequential send"),
+	// 4. 熔断器拒绝发送的触发次数
+	meter.Int64ObservableGauge("app_forwarder_cb_reject_total",
+		metric.WithDescription("Total times send was rejected by circuit breaker"),
 		metric.WithInt64Callback(func(_ context.Context, obs metric.Int64Observer) error {
-			obs.Observe(int64(atomic.LoadUint64(&f.fallbackBatchErrTotal)),
-				metric.WithAttributes(attribute.String("reason", "batch_error")))
-			obs.Observe(int64(atomic.LoadUint64(&f.fallbackStatusNotOK)),
-				metric.WithAttributes(attribute.String("reason", "status_not_ok")))
 			obs.Observe(int64(atomic.LoadUint64(&f.fallbackCBOpenTotal)),
 				metric.WithAttributes(attribute.String("reason", "cb_open")))
 			return nil
@@ -251,7 +238,7 @@ func (f *OrderForwarder) startRecovery(ctx context.Context, wg *sync.WaitGroup) 
 
 // processMessages 批量转发消息到 RocketMQ
 func (f *OrderForwarder) processMessages(ctx context.Context, messages []redis.XMessage) {
-	var batchMsgs []*primitive.Message
+	var batchMsgs []*rmq_client.Message
 	var validMsgIDs []string
 
 	for _, msg := range messages {
@@ -281,15 +268,18 @@ func (f *OrderForwarder) processMessages(ctx context.Context, messages []redis.X
 		// 提取 OrderID 作为 Key
 		orderID, _ := orderData["order_id"].(string)
 
-		pMsg := primitive.NewMessage(targetTopic, []byte(payloadStr))
-		pMsg.WithKeys([]string{orderID})
-		pMsg.WithTag("order_created")
+		pMsg := &rmq_client.Message{
+			Topic: targetTopic,
+			Body:  []byte(payloadStr),
+		}
+		pMsg.SetKeys(orderID)
+		pMsg.SetTag("order_created")
 
 		// 提取并注入 Trace Context
 		if traceData, ok := orderData["trace_ctx"].(map[string]interface{}); ok {
 			for k, v := range traceData {
 				if vStr, ok := v.(string); ok {
-					pMsg.WithProperty(k, vStr)
+					pMsg.AddProperty(k, vStr)
 				}
 			}
 		}
@@ -310,8 +300,9 @@ func (f *OrderForwarder) processMessages(ctx context.Context, messages []redis.X
 	}
 
 	// 批量发送 (熔断器保护)
-	result, err := f.cb.Execute(func() (interface{}, error) {
-		return f.producer.SendSync(ctx, batchMsgs...)
+	// 5.x SDK 不支持原生批量发送，通过熔断器保护并发逐条发送
+	_, err := f.cb.Execute(func() (interface{}, error) {
+		return nil, f.sendBatch(ctx, batchMsgs, validMsgIDs)
 	})
 
 	if err != nil {
@@ -320,43 +311,27 @@ func (f *OrderForwarder) processMessages(ctx context.Context, messages []redis.X
 			atomic.AddUint64(&f.fallbackCBOpenTotal, 1)
 			return
 		}
-		// 批量发送失败 -> 降级为逐条发送
-		f.log.Warnf("[Forwarder] Batch send failed (%v), falling back to sequential send", err)
-		atomic.AddUint64(&f.fallbackBatchErrTotal, 1)
-		f.sequentialSend(ctx, batchMsgs, validMsgIDs)
-		return
-	}
-
-	res := result.(*primitive.SendResult)
-	if res.Status == primitive.SendOK {
-		// 批量 ACK
-		f.rdb.XAck(ctx, streamKeyOrder, forwarderGroup, validMsgIDs...)
-		atomic.AddUint64(&f.sendSuccessTotal, uint64(len(validMsgIDs)))
-		f.log.Debugf("[Forwarder] Forwarded %d messages to RocketMQ", len(validMsgIDs))
-	} else {
-		// 状态非 OK -> 降级为逐条发送
-		f.log.Warnf("[Forwarder] RocketMQ batch send status not OK (%v), falling back to sequential send", res.Status)
-		atomic.AddUint64(&f.fallbackStatusNotOK, 1)
-		f.sequentialSend(ctx, batchMsgs, validMsgIDs)
+		// sendBatch 内部已处理逐条降级，熔断器感知到错误时记录指标
+		f.log.Warnf("[Forwarder] Batch send encountered errors: %v", err)
 	}
 }
 
-// sequentialSend 逐条降级发送：对每条消息单独调用 SendSync
-func (f *OrderForwarder) sequentialSend(ctx context.Context, msgs []*primitive.Message, msgIDs []string) {
+// sendBatch 通过逐条发送模拟批量，统一走熔断器保护
+func (f *OrderForwarder) sendBatch(ctx context.Context, msgs []*rmq_client.Message, msgIDs []string) error {
+	var firstErr error
 	var ackIDs []string
-	var retryMsgIDs []string
 
 	for i, msg := range msgs {
-		res, err := f.producer.SendSync(ctx, msg)
+		_, err := f.producer.Send(ctx, msg)
 		if err != nil {
 			if isTransientMQError(err) {
-				// 临时故障（超时、连接断开、Broker 不可用等）：不 ACK，等待 Recovery 重试
-				f.log.Warnf("[Forwarder Sequential] Transient error for msg (streamID=%s): %v. Will retry via recovery.", msgIDs[i], err)
+				f.log.Warnf("[Forwarder] Transient error for msg (streamID=%s): %v. Will retry via recovery.", msgIDs[i], err)
 				atomic.AddUint64(&f.transientFailTotal, 1)
-				retryMsgIDs = append(retryMsgIDs, msgIDs[i])
+				if firstErr == nil {
+					firstErr = err
+				}
 			} else {
-				// 永久故障（Topic 不存在、消息体非法等）：写入死信队列 + ACK 防止阻塞
-				f.log.Errorf("[Forwarder Sequential] Permanent error for msg (streamID=%s): %v. Sending to dead stream.", msgIDs[i], err)
+				f.log.Errorf("[Forwarder] Permanent error for msg (streamID=%s): %v. Sending to dead stream.", msgIDs[i], err)
 				atomic.AddUint64(&f.permanentFailTotal, 1)
 				if dlqErr := f.dlp.SendToDeadLetter(ctx, streamKeyOrder, forwarderGroup, msgIDs[i], string(msg.Body), fmt.Sprintf("permanent MQ error: %v", err)); dlqErr == nil {
 					atomic.AddUint64(&f.dlqTotal, 1)
@@ -366,33 +341,16 @@ func (f *OrderForwarder) sequentialSend(ctx context.Context, msgs []*primitive.M
 			continue
 		}
 
-		if res.Status == primitive.SendOK {
-			atomic.AddUint64(&f.seqSendSuccessTotal, 1)
-			ackIDs = append(ackIDs, msgIDs[i])
-		} else if isTransientSendStatus(res.Status) {
-			// FlushDiskTimeout / FlushSlaveTimeout / SlaveNotAvailable：属于临时故障，不 ACK
-			f.log.Warnf("[Forwarder Sequential] Transient send status for msg (streamID=%s): %v. Will retry via recovery.", msgIDs[i], res.Status)
-			atomic.AddUint64(&f.transientFailTotal, 1)
-			retryMsgIDs = append(retryMsgIDs, msgIDs[i])
-		} else {
-			// 未知状态：写入死信队列 + ACK 防止阻塞
-			f.log.Errorf("[Forwarder Sequential] Unknown send status for msg (streamID=%s): %v. Sending to dead stream.", msgIDs[i], res.Status)
-			atomic.AddUint64(&f.permanentFailTotal, 1)
-			if dlqErr := f.dlp.SendToDeadLetter(ctx, streamKeyOrder, forwarderGroup, msgIDs[i], string(msg.Body), fmt.Sprintf("unknown send status: %v", res.Status)); dlqErr == nil {
-				atomic.AddUint64(&f.dlqTotal, 1)
-			}
-			ackIDs = append(ackIDs, msgIDs[i])
-		}
-	}
-
-	if len(retryMsgIDs) > 0 {
-		f.log.Warnf("[Forwarder Sequential] %d messages skipped ACK due to transient errors (will retry via recovery)", len(retryMsgIDs))
+		atomic.AddUint64(&f.sendSuccessTotal, 1)
+		ackIDs = append(ackIDs, msgIDs[i])
 	}
 
 	if len(ackIDs) > 0 {
 		f.rdb.XAck(ctx, streamKeyOrder, forwarderGroup, ackIDs...)
-		f.log.Infof("[Forwarder Sequential] Processed %d/%d messages via sequential fallback", len(ackIDs), len(msgs))
+		f.log.Debugf("[Forwarder] ACKed %d/%d messages", len(ackIDs), len(msgs))
 	}
+
+	return firstErr
 }
 
 // isTransientMQError 判断 RocketMQ 错误是否为临时性故障（可重试）
@@ -401,68 +359,17 @@ func isTransientMQError(err error) bool {
 		return false
 	}
 
-	// 1. 检查 RocketMQ Client 预定义的临时性错误
-	if errors.Is(err, mqerrors.ErrRequestTimeout) {
-		return true
-	}
-	if errors.Is(err, mqerrors.ErrBrokerNotFound) {
-		return true
-	}
-	if errors.Is(err, mqerrors.ErrService) {
-		return true
-	}
-
-	// 2. 检查 RocketMQ Remoting 层网络错误
-	if primitive.IsRemotingErr(err) {
-		return true
-	}
-
-	// 3. 检查 Broker 返回的临时性响应码
-	var brokerErr primitive.MQBrokerErr
-	if errors.As(err, &brokerErr) {
-		switch brokerErr.ResponseCode {
-		case 10:
-			return true
-		case 11:
-			return true
-		case 12:
-			return true
-		case 14:
-			return true
-		}
-		return false
-	}
-
-	// 4. 检查底层网络错误（与 isTransientDBError 一致）
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return true
-	}
-
-	// 5. 检查 context 超时/取消（graceful shutdown 场景）
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return true
-	}
-
-	// 6. 基于错误消息字符串的兜底匹配（应对未导出的错误类型）
 	errMsg := strings.ToLower(err.Error())
-	transientKeywords := []string{"timeout", "connection refused", "connect", "system busy", "service not available", "broken pipe", "reset by peer"}
+	transientKeywords := []string{
+		"timeout", "deadline exceeded", "connection refused", "connect",
+		"system busy", "service not available", "broken pipe", "reset by peer",
+		"unavailable", "internal",
+	}
 	for _, kw := range transientKeywords {
 		if strings.Contains(errMsg, kw) {
 			return true
 		}
 	}
 
-	return false // 默认视为永久故障
-}
-
-func isTransientSendStatus(status primitive.SendStatus) bool {
-	switch status {
-	case primitive.SendFlushDiskTimeout,
-		primitive.SendFlushSlaveTimeout,
-		primitive.SendSlaveNotAvailable:
-		return true
-	default:
-		return false
-	}
+	return false
 }
