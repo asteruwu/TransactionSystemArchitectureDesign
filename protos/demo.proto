@@ -396,3 +396,18 @@ message ListOrdersRequest {
 message ListOrdersResponse {
     repeated GetOrderResponse orders = 1;
 }
+
+// ---------------AI Agent service----------------
+service AIAgentService {
+    rpc Chat(ChatRequest) returns (stream ChatResponse) {}
+}
+
+message ChatRequest {
+    string user_id = 1;
+    string message = 2;
+}
+
+message ChatResponse {
+    string chunk = 1;   // 流式文本片段
+    bool done = 2;      // 是否为最后一个 chunk
+}
